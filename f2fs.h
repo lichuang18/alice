@@ -28,6 +28,8 @@
 #include <linux/fscrypt.h>
 #include <linux/fsverity.h>
 
+#include <linux/ioctl.h>
+
 #ifdef CONFIG_F2FS_CHECK_FS
 #define f2fs_bug_on(sbi, condition)	BUG_ON(condition)
 #else
@@ -3660,11 +3662,76 @@ void f2fs_destroy_post_read_processing(void);
 int f2fs_init_post_read_wq(struct f2fs_sb_info *sbi);
 void f2fs_destroy_post_read_wq(struct f2fs_sb_info *sbi);
 
+/* =========================================================
+ * co-gc: read-only GC candidate query
+ * ========================================================= */
+
+#define F2FS_COGC_IOCTL_MAGIC		0xF7
+#define F2FS_GC_CANDIDATE_NR		32
+
+/*
+ * One GC candidate.
+ *
+ * start_blkaddr:
+ *     F2FS logical block address, in F2FS block units.
+ *
+ * start_lba:
+ *     512-byte sector address relative to the F2FS block device.
+ *     For the current 512-B NVMe namespace this is also NVMe SLBA.
+ */
+struct f2fs_gc_candidate {
+	__u32 segno;
+	__u32 valid_blocks;
+	__u32 cost;
+	__u32 reserved;
+
+	__u64 start_blkaddr;
+	__u64 start_lba;
+};
+
+/*
+ * Greedy and CB rankings are independent.
+ * The same segno may therefore occur in both arrays.
+ */
+struct f2fs_gc_candidate_query {
+	/* all dirty DATA segments observed */
+	__u32 nr_dirty_data;
+
+	/* candidates remaining after GC eligibility filtering */
+	__u32 nr_eligible_data;
+
+	/* actual returned count, <= 32 */
+	__u32 nr_greedy;
+	__u32 nr_cb;
+
+	struct f2fs_gc_candidate
+		greedy[F2FS_GC_CANDIDATE_NR];
+
+	struct f2fs_gc_candidate
+		cb[F2FS_GC_CANDIDATE_NR];
+};
+
+/*
+ * Private research ioctl.
+ * We deliberately use a private magic rather than occupying an
+ * existing F2FS UAPI command number.
+ */
+#define F2FS_COGC_IOC_GET_CANDIDATES				\
+	_IOR(F2FS_COGC_IOCTL_MAGIC, 0x01,			\
+	     struct f2fs_gc_candidate_query)
+
+
 /*
  * gc.c
  */
 int f2fs_start_gc_thread(struct f2fs_sb_info *sbi);
 void f2fs_stop_gc_thread(struct f2fs_sb_info *sbi);
+
+// co-gc
+int f2fs_get_gc_candidates(
+	struct f2fs_sb_info *sbi,
+	struct f2fs_gc_candidate_query *query);
+
 block_t f2fs_start_bidx_of_node(unsigned int node_ofs, struct inode *inode);
 int f2fs_gc(struct f2fs_sb_info *sbi, bool sync, bool background, bool force,
 			unsigned int segno);

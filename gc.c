@@ -351,6 +351,249 @@ static inline unsigned int get_gc_cost(struct f2fs_sb_info *sbi,
 	return 0;
 }
 
+/* =========================================================
+ * co-gc: keep one candidate array sorted by cost.
+ *
+ * Smaller cost is better.
+ * segno is used only as a stable tie breaker.
+ * ========================================================= */
+static void insert_gc_candidate(
+	struct f2fs_gc_candidate *list,
+	unsigned int *nr,
+	const struct f2fs_gc_candidate *cand)
+{
+	unsigned int n = *nr;
+	unsigned int pos;
+	unsigned int i;
+
+	/*
+	 * Find insertion position.
+	 */
+	for (pos = 0; pos < n; pos++) {
+		if (cand->cost < list[pos].cost)
+			break;
+
+		if (cand->cost == list[pos].cost &&
+		    cand->segno < list[pos].segno)
+			break;
+	}
+
+	/*
+	 * Already have Top-32 and this candidate is worse
+	 * than all existing entries.
+	 */
+	if (n == F2FS_GC_CANDIDATE_NR &&
+	    pos == F2FS_GC_CANDIDATE_NR)
+		return;
+
+	if (n < F2FS_GC_CANDIDATE_NR)
+		n++;
+
+	/*
+	 * Move worse entries one position backward.
+	 * If list is already full, the old last entry is dropped.
+	 */
+	for (i = n - 1; i > pos; i--)
+		list[i] = list[i - 1];
+
+	list[pos] = *cand;
+	*nr = n;
+}
+
+/* =========================================================
+ * co-gc: snapshot current dirty DATA segments and generate
+ * global Top-32 rankings for Greedy and CB.
+ *
+ * This is read-only with respect to victim selection:
+ * it does NOT trigger GC, remove dirty segments, modify
+ * last_victim, or modify victim_secmap.
+ * ========================================================= */
+int f2fs_get_gc_candidates(
+	struct f2fs_sb_info *sbi,
+	struct f2fs_gc_candidate_query *query)
+{
+	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
+	struct sit_info *sit_i = SIT_I(sbi);
+
+	unsigned long segno;
+
+	unsigned int nr_greedy = 0;
+	unsigned int nr_cb = 0;
+
+	/*
+	 * Our current experiment is strictly segment-level.
+	 *
+	 * The existing victim selection switches to section-oriented
+	 * behavior when sections contain multiple segments, so do not
+	 * silently produce misleading segment-level results.
+	 */
+	if (sbi->segs_per_sec != 1)
+		return -EOPNOTSUPP;
+
+	memset(query, 0, sizeof(*query));
+
+	/*
+	 * Keep GC from selecting/cleaning a victim while this snapshot
+	 * is being generated.
+	 */
+	down_read(&sbi->gc_lock);
+
+	/*
+	 * Match the existing F2FS lock order:
+	 *
+	 *     sentry_lock
+	 *         -> seglist_lock
+	 *
+	 * __get_victim() in this kernel already takes sentry_lock
+	 * before calling the victim-selection implementation.
+	 */
+	down_write(&sit_i->sentry_lock);
+	mutex_lock(&dirty_i->seglist_lock);
+
+	/*
+	 * Deliberately scan ALL current DIRTY segments.
+	 *
+	 * Unlike normal BG victim selection, this experimental
+	 * snapshot does not apply max_victim_search or last_victim.
+	 */
+	for_each_set_bit(segno,
+			 dirty_i->dirty_segmap[DIRTY],
+			 MAIN_SEGS(sbi)) {
+
+		struct seg_entry *se;
+		struct f2fs_gc_candidate cand;
+
+		unsigned int cur_segno = (unsigned int)segno;
+		unsigned int secno;
+		unsigned int valid_blocks;
+		unsigned int greedy_cost;
+		unsigned int cb_cost;
+
+		se = get_seg_entry(sbi, cur_segno);
+
+		/*
+		 * Only DATA segments.
+		 *
+		 * HOT / WARM / COLD DATA are treated identically.
+		 * NODE segments are excluded.
+		 */
+		if (!IS_DATASEG(se->type))
+			continue;
+
+		query->nr_dirty_data++;
+
+#ifdef CONFIG_F2FS_CHECK_FS
+		/*
+		 * Same defensive filtering used by normal victim
+		 * selection for invalid segments.
+		 */
+		if (test_bit(cur_segno, sit_i->invalid_segmap))
+			continue;
+#endif
+
+		secno = GET_SEC_FROM_SEG(sbi, cur_segno);
+
+		/*
+		 * Do not select a section currently in use.
+		 * Normal F2FS victim selection performs the same check.
+		 */
+		if (sec_usage_check(sbi, secno))
+			continue;
+
+		/*
+		 * Match the LFS restriction used when checkpointing
+		 * is disabled.
+		 */
+		if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED))) {
+			if (get_ckpt_valid_blocks(sbi, cur_segno, true))
+				continue;
+		}
+
+		/*
+		 * Report actual segment-level valid blocks.
+		 */
+		valid_blocks =
+			get_valid_blocks(sbi, cur_segno, false);
+
+		/*
+		 * DIRTY should normally already imply:
+		 *
+		 *     0 < valid_blocks < blocks_per_seg
+		 *
+		 * Keep this check to protect the experimental ABI.
+		 */
+		if (!valid_blocks ||
+		    valid_blocks >= sbi->blocks_per_seg)
+			continue;
+
+		query->nr_eligible_data++;
+
+		memset(&cand, 0, sizeof(cand));
+
+		cand.segno = cur_segno;
+		cand.valid_blocks = valid_blocks;
+
+		/*
+		 * F2FS logical block address of this segment.
+		 */
+		cand.start_blkaddr =
+			(__u64)START_BLOCK(sbi, cur_segno);
+
+		/*
+		 * Convert F2FS block address to 512-byte sector address.
+		 *
+		 * Current setup:
+		 *
+		 * 4 KiB F2FS block = 8 × 512-B sectors.
+		 */
+		cand.start_lba =
+			cand.start_blkaddr <<
+			sbi->log_sectors_per_block;
+
+		/*
+		 * -----------------------------
+		 * Greedy ranking
+		 * -----------------------------
+		 *
+		 * Exactly use the current F2FS Greedy cost:
+		 * valid blocks, smaller is better.
+		 */
+		greedy_cost =
+			get_valid_blocks(sbi, cur_segno, true);
+
+		cand.cost = greedy_cost;
+
+		insert_gc_candidate(query->greedy,
+				    &nr_greedy,
+				    &cand);
+
+		/*
+		 * -----------------------------
+		 * CB ranking
+		 * -----------------------------
+		 *
+		 * Directly reuse the existing get_cb_cost().
+		 */
+		cb_cost = get_cb_cost(sbi, cur_segno);
+
+		cand.cost = cb_cost;
+
+		insert_gc_candidate(query->cb,
+				    &nr_cb,
+				    &cand);
+	}
+
+	query->nr_greedy = nr_greedy;
+	query->nr_cb = nr_cb;
+
+	mutex_unlock(&dirty_i->seglist_lock);
+	up_write(&sit_i->sentry_lock);
+	up_read(&sbi->gc_lock);
+
+	return 0;
+}
+
+
 static unsigned int count_bits(const unsigned long *addr,
 				unsigned int offset, unsigned int len)
 {

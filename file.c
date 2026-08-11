@@ -4220,6 +4220,46 @@ out:
 	return ret;
 }
 
+/* =========================================================
+ * co-gc: export shadow Greedy/CB Top-32 candidates
+ * ========================================================= */
+static int f2fs_ioc_get_gc_candidates(
+	struct file *filp,
+	unsigned long arg)
+{
+	struct inode *inode = file_inode(filp);
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+
+	struct f2fs_gc_candidate_query *query;
+	int ret;
+
+	/*
+	 * Experimental internal-state interface.
+	 */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	query = kzalloc(sizeof(*query), GFP_KERNEL);
+	if (!query)
+		return -ENOMEM;
+
+	ret = f2fs_get_gc_candidates(sbi, query);
+	if (ret)
+		goto out;
+
+	if (copy_to_user(
+			(struct f2fs_gc_candidate_query __user *)arg,
+			query,
+			sizeof(*query))) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+out:
+	kfree(query);
+	return ret;
+}
+
 static long __f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
@@ -4261,6 +4301,8 @@ static long __f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return f2fs_ioc_gc(filp, arg);
 	case F2FS_IOC_GARBAGE_COLLECT_RANGE:
 		return f2fs_ioc_gc_range(filp, arg);
+	case F2FS_COGC_IOC_GET_CANDIDATES: // co-gc
+		return f2fs_ioc_get_gc_candidates(filp, arg);
 	case F2FS_IOC_WRITE_CHECKPOINT:
 		return f2fs_ioc_write_checkpoint(filp, arg);
 	case F2FS_IOC_DEFRAGMENT:
@@ -4564,6 +4606,7 @@ long f2fs_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case FS_IOC_GET_ENCRYPTION_NONCE:
 	case F2FS_IOC_GARBAGE_COLLECT:
 	case F2FS_IOC_WRITE_CHECKPOINT:
+	case F2FS_COGC_IOC_GET_CANDIDATES:
 	case F2FS_IOC_DEFRAGMENT:
 	case F2FS_IOC_FLUSH_DEVICE:
 	case F2FS_IOC_GET_FEATURES:
