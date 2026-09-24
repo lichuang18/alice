@@ -2200,6 +2200,53 @@ out:
 }
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
+/*
+ * Conservative CoPack P1 stores the shared page in the even sibling's last
+ * compressed-address slot.  The odd sibling derives it from that fixed
+ * partner instead of storing a second mapping.
+ */
+static int f2fs_copack_get_shared_blkaddr(struct dnode_of_data *odd_dn,
+			pgoff_t odd_cluster_idx, block_t *shared)
+{
+	unsigned int cluster_size = F2FS_I(odd_dn->inode)->i_cluster_size;
+	unsigned int even_ofs;
+	block_t last = NULL_ADDR;
+	int i;
+
+	if (!(odd_cluster_idx & 1) || odd_cluster_idx == 0)
+		return -EINVAL;
+
+	/*
+	 * f2fs_read_multi_pages() already holds odd_dn->node_page locked.
+	 * Do not call f2fs_get_dnode_of_data() again for the even sibling here:
+	 * when both clusters share the same node page that recursively waits on
+	 * the very page we already hold and deadlocks.  P1 therefore only
+	 * accepts CoPack pairs whose two cluster markers live in one node page.
+	 */
+	if (odd_dn->ofs_in_node < cluster_size)
+		return -EFSCORRUPTED;
+
+	even_ofs = odd_dn->ofs_in_node - cluster_size;
+	if (data_blkaddr(odd_dn->inode, odd_dn->node_page, even_ofs) !=
+			COPACK_ADDR)
+		return -EFSCORRUPTED;
+
+	for (i = 1; i < cluster_size; i++) {
+		block_t blkaddr = data_blkaddr(odd_dn->inode, odd_dn->node_page,
+					even_ofs + i);
+
+		if (!__is_valid_data_blkaddr(blkaddr))
+			break;
+		last = blkaddr;
+	}
+
+	if (!__is_valid_data_blkaddr(last))
+		return -EFSCORRUPTED;
+
+	*shared = last;
+	return 0;
+}
+
 int f2fs_read_multi_pages(struct compress_ctx *cc, struct bio **bio_ret,
 				unsigned nr_pages, sector_t *last_block_in_bio,
 				bool is_readahead, bool for_write)
@@ -2246,8 +2293,12 @@ int f2fs_read_multi_pages(struct compress_ctx *cc, struct bio **bio_ret,
 	if (f2fs_cluster_is_empty(cc))
 		goto out;
 
-	if (f2fs_lookup_extent_cache(inode, start_idx, &ei))
-		from_dnode = false;
+	/*
+	 * P1 always reads the dnode so COPACK_ADDR can be distinguished from
+	 * stock COMPRESS_ADDR.  Re-enable the compressed extent-cache fast path
+	 * after CoPack extent semantics are defined.
+	 */
+	from_dnode = true;
 
 	if (!from_dnode)
 		goto skip_reading_dnode;
@@ -2257,7 +2308,12 @@ int f2fs_read_multi_pages(struct compress_ctx *cc, struct bio **bio_ret,
 	if (ret)
 		goto out;
 
-	f2fs_bug_on(sbi, dn.data_blkaddr != COMPRESS_ADDR);
+	f2fs_bug_on(sbi, !f2fs_is_compress_marker(dn.data_blkaddr));
+	if (dn.data_blkaddr == COPACK_ADDR) {
+		/* P1 disables the compressed extent-cache shortcut for CoPack. */
+		cc->copack = true;
+		cc->copack_odd = !!(cc->cluster_idx & 1);
+	}
 
 skip_reading_dnode:
 	for (i = 1; i < cc->cluster_size; i++) {
@@ -2280,6 +2336,16 @@ skip_reading_dnode:
 			break;
 	}
 
+	if (cc->copack && cc->copack_odd) {
+		cc->copack_private_cpages = cc->nr_cpages;
+		ret = f2fs_copack_get_shared_blkaddr(&dn, cc->cluster_idx,
+						&cc->copack_blkaddr);
+		if (ret)
+			goto out_put_dnode;
+		/* The missing terminal compressed page is reconstructed from shared. */
+		cc->nr_cpages++;
+	}
+
 	/* nothing to decompress */
 	if (cc->nr_cpages == 0) {
 		ret = 0;
@@ -2297,9 +2363,13 @@ skip_reading_dnode:
 		block_t blkaddr;
 		struct bio_post_read_ctx *ctx;
 
-		blkaddr = from_dnode ? data_blkaddr(dn.inode, dn.node_page,
-					dn.ofs_in_node + i + 1) :
-					ei.blk + i;
+		if (cc->copack && cc->copack_odd &&
+				i == cc->copack_private_cpages)
+			blkaddr = cc->copack_blkaddr;
+		else
+			blkaddr = from_dnode ? data_blkaddr(dn.inode, dn.node_page,
+						dn.ofs_in_node + i + 1) :
+						ei.blk + i;
 
 		f2fs_wait_on_block_writeback(inode, blkaddr);
 
@@ -3015,24 +3085,27 @@ static int f2fs_flush_copack_pair(struct compress_ctx cc[2],
 					(cc[1].cluster_idx >> 1));
 	}
 
-	for (slot = 0; slot < 2; slot++) {
-		int nr_submitted = 0;
-		int err;
+	if (!f2fs_cluster_is_empty(&cc[0]) &&
+		!f2fs_cluster_is_empty(&cc[1]) &&
+		cc[0].nr_rpages == cc[0].cluster_size &&
+		cc[1].nr_rpages == cc[1].cluster_size) {
+		first_err = f2fs_write_copack_pair(&cc[0], &cc[1],
+						&total_submitted, wbc, io_type);
+	} else {
+		/* Incomplete/one-sided pair keeps the stock P0 fallback. */
+		for (slot = 0; slot < 2; slot++) {
+			int nr_submitted = 0;
+			int err;
 
-		if (f2fs_cluster_is_empty(&cc[slot]))
-			continue;
+			if (f2fs_cluster_is_empty(&cc[slot]))
+				continue;
 
-		err = f2fs_write_multi_pages(&cc[slot], &nr_submitted,
-						wbc, io_type);
-		total_submitted += nr_submitted;
-
-		/*
-		 * Always drain both contexts.  Pages kept in the second context
-		 * are locked and hold references, so returning after the first
-		 * error would strand them.  Preserve the first error for the caller.
-		 */
-		if (!first_err && err)
-			first_err = err;
+			err = f2fs_write_multi_pages(&cc[slot], &nr_submitted,
+							wbc, io_type);
+			total_submitted += nr_submitted;
+			if (!first_err && err)
+				first_err = err;
+		}
 	}
 
 	*submitted = total_submitted;
@@ -4003,7 +4076,7 @@ static sector_t f2fs_bmap_compress(struct inode *inode, sector_t block)
 	if (ret)
 		return 0;
 
-	if (dn.data_blkaddr != COMPRESS_ADDR) {
+	if (!f2fs_is_compress_marker(dn.data_blkaddr)) {
 		dn.ofs_in_node += block - start_idx;
 		blknr = f2fs_data_blkaddr(&dn);
 		if (!__is_valid_data_blkaddr(blknr))

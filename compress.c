@@ -153,6 +153,10 @@ void f2fs_destroy_compress_ctx(struct compress_ctx *cc, bool reuse)
 	cc->rpages = NULL;
 	cc->nr_rpages = 0;
 	cc->nr_cpages = 0;
+	cc->copack = false;
+	cc->copack_odd = false;
+	cc->copack_private_cpages = 0;
+	cc->copack_blkaddr = NULL_ADDR;
 	if (!reuse)
 		cc->cluster_idx = NULL_CLUSTER;
 }
@@ -780,6 +784,35 @@ void f2fs_decompress_cluster(struct decompress_io_ctx *dic)
 			goto out_end_io;
 	}
 
+	if (dic->copack && dic->copack_odd) {
+		struct compress_data *hdr;
+		void *first_addr, *last_addr;
+		size_t rep_size, tail_len;
+
+		if (!dic->copack_private_cpages ||
+				dic->copack_private_cpages + 1 != dic->nr_cpages) {
+			ret = -EFSCORRUPTED;
+			goto out_destroy_decompress_ctx;
+		}
+
+		first_addr = kmap_local_page(dic->cpages[0]);
+		hdr = (struct compress_data *)first_addr;
+		rep_size = COMPRESS_HEADER_SIZE + le32_to_cpu(hdr->clen);
+		kunmap_local(first_addr);
+
+		if (rep_size <= dic->copack_private_cpages * PAGE_SIZE ||
+				rep_size > dic->nr_cpages * PAGE_SIZE) {
+			ret = -EFSCORRUPTED;
+			goto out_destroy_decompress_ctx;
+		}
+		tail_len = rep_size - dic->copack_private_cpages * PAGE_SIZE;
+
+		last_addr = kmap_local_page(dic->cpages[dic->nr_cpages - 1]);
+		memmove(last_addr, last_addr + PAGE_SIZE - tail_len, tail_len);
+		memset(last_addr + tail_len, 0, PAGE_SIZE - tail_len);
+		kunmap_local(last_addr);
+	}
+
 	dic->rbuf = f2fs_vmap(dic->tpages, dic->cluster_size);
 	if (!dic->rbuf) {
 		ret = -ENOMEM;
@@ -902,7 +935,7 @@ bool f2fs_sanity_check_cluster(struct dnode_of_data *dn)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
 	unsigned int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
-	bool compressed = dn->data_blkaddr == COMPRESS_ADDR;
+	bool compressed = f2fs_is_compress_marker(dn->data_blkaddr);
 	int cluster_end = 0;
 	int i;
 	char *reason = "";
@@ -921,7 +954,7 @@ bool f2fs_sanity_check_cluster(struct dnode_of_data *dn)
 							dn->ofs_in_node + i);
 
 		/* [COMPR_ADDR, ..., COMPR_ADDR] */
-		if (blkaddr == COMPRESS_ADDR) {
+		if (f2fs_is_compress_marker(blkaddr)) {
 			reason = "[C|*|C|*]";
 			goto out;
 		}
@@ -968,7 +1001,7 @@ static int __f2fs_cluster_blocks(struct inode *inode,
 		goto fail;
 	}
 
-	if (dn.data_blkaddr == COMPRESS_ADDR) {
+	if (f2fs_is_compress_marker(dn.data_blkaddr)) {
 		int i;
 
 		ret = 1;
@@ -1218,7 +1251,8 @@ int f2fs_truncate_partial_cluster(struct inode *inode, u64 from, bool lock)
 static int f2fs_write_compressed_pages(struct compress_ctx *cc,
 					int *submitted,
 					struct writeback_control *wbc,
-					enum iostat_type io_type)
+					enum iostat_type io_type,
+					block_t cluster_marker)
 {
 	struct inode *inode = cc->inode;
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
@@ -1331,11 +1365,11 @@ static int f2fs_write_compressed_pages(struct compress_ctx *cc,
 
 		/* cluster header */
 		if (i == 0) {
-			if (blkaddr == COMPRESS_ADDR)
+			if (f2fs_is_compress_marker(blkaddr))
 				fio.compr_blocks++;
 			if (__is_valid_data_blkaddr(blkaddr))
 				f2fs_invalidate_blocks(sbi, blkaddr);
-			f2fs_update_data_blkaddr(&dn, COMPRESS_ADDR);
+			f2fs_update_data_blkaddr(&dn, cluster_marker);
 			goto unlock_continue;
 		}
 
@@ -1528,6 +1562,232 @@ out:
 	return ret;
 }
 
+
+static bool f2fs_copack_same_node_page(struct compress_ctx *even,
+				struct compress_ctx *odd)
+{
+	struct dnode_of_data even_dn, odd_dn;
+	pgoff_t even_start = start_idx_of_cluster(even);
+	pgoff_t odd_start = start_idx_of_cluster(odd);
+	nid_t even_nid;
+	int ret;
+
+	set_new_dnode(&even_dn, even->inode, NULL, NULL, 0);
+	ret = f2fs_get_dnode_of_data(&even_dn, even_start, LOOKUP_NODE);
+	if (ret)
+		return false;
+	even_nid = even_dn.nid;
+	f2fs_put_dnode(&even_dn);
+
+	set_new_dnode(&odd_dn, odd->inode, NULL, NULL, 0);
+	ret = f2fs_get_dnode_of_data(&odd_dn, odd_start, LOOKUP_NODE);
+	if (ret)
+		return false;
+
+	/* Same nid is sufficient: both address ranges are in one node page. */
+	ret = odd_dn.nid == even_nid;
+	f2fs_put_dnode(&odd_dn);
+
+	return ret;
+}
+
+static bool f2fs_copack_eligible(struct compress_ctx *even,
+				struct compress_ctx *odd,
+				unsigned int *even_tail,
+				unsigned int *odd_tail)
+{
+	size_t even_rep = COMPRESS_HEADER_SIZE + even->clen;
+	size_t odd_rep = COMPRESS_HEADER_SIZE + odd->clen;
+
+	/* P1 deliberately excludes single-page compressed representations. */
+	if (even->nr_cpages < 2 || odd->nr_cpages < 2)
+		return false;
+
+	*even_tail = even_rep & (PAGE_SIZE - 1);
+	*odd_tail = odd_rep & (PAGE_SIZE - 1);
+	if (!*even_tail || !*odd_tail)
+		return false;
+	if (*even_tail + *odd_tail > PAGE_SIZE)
+		return false;
+
+	/* P1 does not support fscrypt pages sharing one physical page. */
+	if (fscrypt_inode_uses_fs_layer_crypto(even->inode))
+		return false;
+
+	/* P1 read reconstruction uses the already-held node page. */
+	if (!f2fs_copack_same_node_page(even, odd))
+		return false;
+
+	return true;
+}
+
+static int f2fs_copack_merge_tail(struct compress_ctx *even,
+				struct compress_ctx *odd,
+				unsigned int even_tail,
+				unsigned int odd_tail)
+{
+	struct page **new_cpages;
+	struct page *odd_tail_page;
+	unsigned int old_nr = odd->nr_cpages;
+	void *even_addr, *odd_addr;
+	int i;
+
+	/* Allocate replacement metadata before changing either compressed stream. */
+	new_cpages = page_array_alloc(odd->inode, old_nr - 1);
+	if (!new_cpages)
+		return -ENOMEM;
+
+	/* even's last cpage becomes the single shared page. */
+	even_addr = kmap_local_page(even->cpages[even->nr_cpages - 1]);
+	odd_addr = kmap_local_page(odd->cpages[odd->nr_cpages - 1]);
+	memset(even_addr + even_tail, 0,
+			PAGE_SIZE - even_tail - odd_tail);
+	memcpy(even_addr + PAGE_SIZE - odd_tail, odd_addr, odd_tail);
+	kunmap_local(odd_addr);
+	kunmap_local(even_addr);
+
+	/* Remove odd's terminal cpage from its own write set. */
+	for (i = 0; i < old_nr - 1; i++)
+		new_cpages[i] = odd->cpages[i];
+
+	odd_tail_page = odd->cpages[old_nr - 1];
+	page_array_free(odd->inode, odd->cpages, old_nr);
+	odd->cpages = new_cpages;
+	odd->nr_cpages = old_nr - 1;
+	f2fs_compress_free_page(odd_tail_page);
+	return 0;
+}
+
+static int f2fs_finish_pair_side(struct compress_ctx *cc, int comp_ret,
+				int *submitted,
+				struct writeback_control *wbc,
+				enum iostat_type io_type)
+{
+	int err;
+
+	if (!comp_ret)
+		return f2fs_write_compressed_pages(cc, submitted, wbc, io_type,
+						COMPRESS_ADDR);
+
+	if (comp_ret == -EAGAIN) {
+		add_compr_block_stat(cc->inode, cc->cluster_size);
+		err = f2fs_write_raw_pages(cc, submitted, wbc, io_type);
+		f2fs_put_rpages_wbc(cc, wbc, false, 0);
+		f2fs_destroy_compress_ctx(cc, false);
+		return err;
+	}
+
+	f2fs_put_rpages_wbc(cc, wbc, true, 1);
+	f2fs_destroy_compress_ctx(cc, false);
+	return comp_ret;
+}
+
+/*
+ * P1 conservative CoPack prototype.
+ *
+ * This version really shares the two terminal compressed fragments and is
+ * readable, but deliberately keeps the shared page in the even cluster's
+ * last compressed-address slot.  It is a test vehicle for end-to-end
+ * correctness/benefit/overhead before the later hidden-block representation.
+ */
+int f2fs_write_copack_pair(struct compress_ctx *even,
+				struct compress_ctx *odd,
+				int *submitted,
+				struct writeback_control *wbc,
+				enum iostat_type io_type)
+{
+	unsigned int even_tail = 0, odd_tail = 0;
+	unsigned int stock_blocks, copack_blocks;
+	pgoff_t pair_idx = even->cluster_idx >> 1;
+	int even_ret, odd_ret;
+	int even_submitted = 0, odd_submitted = 0;
+	int ret = 0, err;
+
+	*submitted = 0;
+
+	if (!cluster_may_compress(even) || !cluster_may_compress(odd))
+		goto stock_pair;
+
+	even_ret = f2fs_compress_pages(even);
+	odd_ret = f2fs_compress_pages(odd);
+
+	if (even_ret || odd_ret) {
+		err = f2fs_finish_pair_side(even, even_ret, &even_submitted,
+						wbc, io_type);
+		if (err)
+			ret = err;
+		err = f2fs_finish_pair_side(odd, odd_ret, &odd_submitted,
+						wbc, io_type);
+		if (!ret && err)
+			ret = err;
+		*submitted = even_submitted + odd_submitted;
+		return ret;
+	}
+
+	if (!f2fs_copack_eligible(even, odd, &even_tail, &odd_tail)) {
+		err = f2fs_write_compressed_pages(even, &even_submitted,
+						wbc, io_type, COMPRESS_ADDR);
+		if (err)
+			ret = err;
+		err = f2fs_write_compressed_pages(odd, &odd_submitted,
+						wbc, io_type, COMPRESS_ADDR);
+		if (!ret && err)
+			ret = err;
+		*submitted = even_submitted + odd_submitted;
+		return ret;
+	}
+
+	stock_blocks = even->nr_cpages + odd->nr_cpages;
+	err = f2fs_copack_merge_tail(even, odd, even_tail, odd_tail);
+	if (err) {
+		/* Compression succeeded; if metadata allocation fails, use stock. */
+		err = f2fs_write_compressed_pages(even, &even_submitted,
+						wbc, io_type, COMPRESS_ADDR);
+		if (err)
+			ret = err;
+		err = f2fs_write_compressed_pages(odd, &odd_submitted,
+						wbc, io_type, COMPRESS_ADDR);
+		if (!ret && err)
+			ret = err;
+		*submitted = even_submitted + odd_submitted;
+		return ret;
+	}
+
+	copack_blocks = even->nr_cpages + odd->nr_cpages;
+
+	/*
+	 * Write even first: its last mapped cpage is the shared block.  Odd uses
+	 * COPACK_ADDR too, but stores only its private cpages.  The read path
+	 * derives odd's shared page from the fixed even sibling.
+	 */
+	err = f2fs_write_compressed_pages(even, &even_submitted,
+					wbc, io_type, COPACK_ADDR);
+	if (err)
+		ret = err;
+	err = f2fs_write_compressed_pages(odd, &odd_submitted,
+					wbc, io_type, COPACK_ADDR);
+	if (!ret && err)
+		ret = err;
+
+	*submitted = even_submitted + odd_submitted;
+	if (!ret)
+		pr_info_ratelimited("COPACK_P1 ino=%lu pair=%lu tails=%u+%u stock=%u copack=%u saved=%u\n",
+			even->inode->i_ino, pair_idx,
+			even_tail, odd_tail, stock_blocks, copack_blocks,
+			stock_blocks - copack_blocks);
+	return ret;
+
+stock_pair:
+	err = f2fs_write_multi_pages(even, &even_submitted, wbc, io_type);
+	if (err)
+		ret = err;
+	err = f2fs_write_multi_pages(odd, &odd_submitted, wbc, io_type);
+	if (!ret && err)
+		ret = err;
+	*submitted = even_submitted + odd_submitted;
+	return ret;
+}
+
 int f2fs_write_multi_pages(struct compress_ctx *cc,
 					int *submitted,
 					struct writeback_control *wbc,
@@ -1547,7 +1807,7 @@ int f2fs_write_multi_pages(struct compress_ctx *cc,
 		}
 
 		err = f2fs_write_compressed_pages(cc, submitted,
-							wbc, io_type);
+							wbc, io_type, COMPRESS_ADDR);
 		if (!err)
 			return 0;
 		f2fs_bug_on(F2FS_I_SB(cc->inode), err != -EAGAIN);
@@ -1591,6 +1851,10 @@ struct decompress_io_ctx *f2fs_alloc_dic(struct compress_ctx *cc)
 	refcount_set(&dic->refcnt, 1);
 	dic->failed = false;
 	dic->need_verity = f2fs_need_verity(cc->inode, start_idx);
+	dic->copack = cc->copack;
+	dic->copack_odd = cc->copack_odd;
+	dic->copack_private_cpages = cc->copack_private_cpages;
+	dic->copack_blkaddr = cc->copack_blkaddr;
 
 	for (i = 0; i < dic->cluster_size; i++)
 		dic->rpages[i] = cc->rpages[i];
@@ -1737,9 +2001,16 @@ void f2fs_put_page_dic(struct page *page)
  */
 unsigned int f2fs_cluster_blocks_are_contiguous(struct dnode_of_data *dn)
 {
-	bool compressed = f2fs_data_blkaddr(dn) == COMPRESS_ADDR;
-	int i = compressed ? 1 : 0;
-	block_t first_blkaddr = data_blkaddr(dn->inode, dn->node_page,
+	block_t marker = f2fs_data_blkaddr(dn);
+	bool compressed;
+	int i;
+	block_t first_blkaddr;
+
+	if (marker == COPACK_ADDR)
+		return 0;
+	compressed = marker == COMPRESS_ADDR;
+	i = compressed ? 1 : 0;
+	first_blkaddr = data_blkaddr(dn->inode, dn->node_page,
 						dn->ofs_in_node + i);
 
 	for (i += 1; i < F2FS_I(dn->inode)->i_cluster_size; i++) {

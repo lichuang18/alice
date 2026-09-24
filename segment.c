@@ -2417,7 +2417,7 @@ void f2fs_invalidate_blocks(struct f2fs_sb_info *sbi, block_t addr)
 	struct sit_info *sit_i = SIT_I(sbi);
 
 	f2fs_bug_on(sbi, addr == NULL_ADDR);
-	if (addr == NEW_ADDR || addr == COMPRESS_ADDR)
+	if (addr == NEW_ADDR || f2fs_is_compress_marker(addr))
 		return;
 
 	invalidate_mapping_pages(META_MAPPING(sbi), addr, addr);

@@ -582,7 +582,7 @@ void f2fs_truncate_data_blocks_range(struct dnode_of_data *dn, int count)
 			if (compressed_cluster)
 				f2fs_i_compr_blocks_update(dn->inode,
 							valid_blocks, false);
-			compressed_cluster = (blkaddr == COMPRESS_ADDR);
+			compressed_cluster = f2fs_is_compress_marker(blkaddr);
 			valid_blocks = 0;
 		}
 
@@ -605,7 +605,7 @@ void f2fs_truncate_data_blocks_range(struct dnode_of_data *dn, int count)
 
 		f2fs_invalidate_blocks(sbi, blkaddr);
 
-		if (!released || blkaddr != COMPRESS_ADDR)
+		if (!released || !f2fs_is_compress_marker(blkaddr))
 			nr_free++;
 	}
 
@@ -3464,7 +3464,7 @@ static int release_compress_blocks(struct dnode_of_data *dn, pgoff_t count)
 			blkaddr = f2fs_data_blkaddr(dn);
 
 			if (i == 0) {
-				if (blkaddr == COMPRESS_ADDR)
+				if (f2fs_is_compress_marker(blkaddr))
 					continue;
 				dn->ofs_in_node += cluster_size;
 				goto next;
@@ -3631,7 +3631,7 @@ static int reserve_compress_blocks(struct dnode_of_data *dn, pgoff_t count,
 			blkaddr = f2fs_data_blkaddr(dn);
 
 			if (i == 0) {
-				if (blkaddr == COMPRESS_ADDR)
+				if (f2fs_is_compress_marker(blkaddr))
 					continue;
 				dn->ofs_in_node += cluster_size;
 				goto next;

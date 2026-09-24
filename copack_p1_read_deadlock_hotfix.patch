@@ -1,0 +1,129 @@
+--- a/data.c
++++ b/data.c
+@@ -2205,33 +2205,35 @@
+  * compressed-address slot.  The odd sibling derives it from that fixed
+  * partner instead of storing a second mapping.
+  */
+-static int f2fs_copack_get_shared_blkaddr(struct inode *inode,
++static int f2fs_copack_get_shared_blkaddr(struct dnode_of_data *odd_dn,
+ 			pgoff_t odd_cluster_idx, block_t *shared)
+ {
+-	struct dnode_of_data dn;
+-	unsigned int cluster_size = F2FS_I(inode)->i_cluster_size;
+-	pgoff_t even_start;
++	unsigned int cluster_size = F2FS_I(odd_dn->inode)->i_cluster_size;
++	unsigned int even_ofs;
+ 	block_t last = NULL_ADDR;
+-	int i, ret;
++	int i;
+ 
+ 	if (!(odd_cluster_idx & 1) || odd_cluster_idx == 0)
+ 		return -EINVAL;
+ 
+-	even_start = (odd_cluster_idx - 1) <<
+-				F2FS_I(inode)->i_log_cluster_size;
+-	set_new_dnode(&dn, inode, NULL, NULL, 0);
+-	ret = f2fs_get_dnode_of_data(&dn, even_start, LOOKUP_NODE);
+-	if (ret)
+-		return ret;
++	/*
++	 * f2fs_read_multi_pages() already holds odd_dn->node_page locked.
++	 * Do not call f2fs_get_dnode_of_data() again for the even sibling here:
++	 * when both clusters share the same node page that recursively waits on
++	 * the very page we already hold and deadlocks.  P1 therefore only
++	 * accepts CoPack pairs whose two cluster markers live in one node page.
++	 */
++	if (odd_dn->ofs_in_node < cluster_size)
++		return -EFSCORRUPTED;
+ 
+-	if (dn.data_blkaddr != COPACK_ADDR) {
+-		ret = -EFSCORRUPTED;
+-		goto out;
+-	}
++	even_ofs = odd_dn->ofs_in_node - cluster_size;
++	if (data_blkaddr(odd_dn->inode, odd_dn->node_page, even_ofs) !=
++			COPACK_ADDR)
++		return -EFSCORRUPTED;
+ 
+ 	for (i = 1; i < cluster_size; i++) {
+-		block_t blkaddr = data_blkaddr(dn.inode, dn.node_page,
+-					dn.ofs_in_node + i);
++		block_t blkaddr = data_blkaddr(odd_dn->inode, odd_dn->node_page,
++					even_ofs + i);
+ 
+ 		if (!__is_valid_data_blkaddr(blkaddr))
+ 			break;
+@@ -2239,12 +2241,10 @@
+ 	}
+ 
+ 	if (!__is_valid_data_blkaddr(last))
+-		ret = -EFSCORRUPTED;
+-	else
+-		*shared = last;
+-out:
+-	f2fs_put_dnode(&dn);
+-	return ret;
++		return -EFSCORRUPTED;
++
++	*shared = last;
++	return 0;
+ }
+ 
+ int f2fs_read_multi_pages(struct compress_ctx *cc, struct bio **bio_ret,
+@@ -2338,7 +2338,7 @@
+ 
+ 	if (cc->copack && cc->copack_odd) {
+ 		cc->copack_private_cpages = cc->nr_cpages;
+-		ret = f2fs_copack_get_shared_blkaddr(inode, cc->cluster_idx,
++		ret = f2fs_copack_get_shared_blkaddr(&dn, cc->cluster_idx,
+ 						&cc->copack_blkaddr);
+ 		if (ret)
+ 			goto out_put_dnode;
+--- a/compress.c
++++ b/compress.c
+@@ -1563,6 +1563,34 @@
+ }
+ 
+ 
++static bool f2fs_copack_same_node_page(struct compress_ctx *even,
++				struct compress_ctx *odd)
++{
++	struct dnode_of_data even_dn, odd_dn;
++	pgoff_t even_start = start_idx_of_cluster(even);
++	pgoff_t odd_start = start_idx_of_cluster(odd);
++	nid_t even_nid;
++	int ret;
++
++	set_new_dnode(&even_dn, even->inode, NULL, NULL, 0);
++	ret = f2fs_get_dnode_of_data(&even_dn, even_start, LOOKUP_NODE);
++	if (ret)
++		return false;
++	even_nid = even_dn.nid;
++	f2fs_put_dnode(&even_dn);
++
++	set_new_dnode(&odd_dn, odd->inode, NULL, NULL, 0);
++	ret = f2fs_get_dnode_of_data(&odd_dn, odd_start, LOOKUP_NODE);
++	if (ret)
++		return false;
++
++	/* Same nid is sufficient: both address ranges are in one node page. */
++	ret = odd_dn.nid == even_nid;
++	f2fs_put_dnode(&odd_dn);
++
++	return ret;
++}
++
+ static bool f2fs_copack_eligible(struct compress_ctx *even,
+ 				struct compress_ctx *odd,
+ 				unsigned int *even_tail,
+@@ -1586,6 +1614,10 @@
+ 	if (fscrypt_inode_uses_fs_layer_crypto(even->inode))
+ 		return false;
+ 
++	/* P1 read reconstruction uses the already-held node page. */
++	if (!f2fs_copack_same_node_page(even, odd))
++		return false;
++
+ 	return true;
+ }
+ 

@@ -1503,6 +1503,12 @@ struct compress_ctx {
 	size_t clen;			/* valid data length in cbuf */
 	void *private;			/* payload buffer for specified compression algorithm */
 	void *private2;			/* extra payload buffer */
+
+	/* CoPack P1 runtime-only read state; never persisted on disk. */
+	bool copack;
+	bool copack_odd;
+	unsigned int copack_private_cpages;
+	block_t copack_blkaddr;
 };
 
 /* compress context for write IO path */
@@ -1558,6 +1564,13 @@ struct decompress_io_ctx {
 
 	bool failed;			/* IO error occurred before decompression? */
 	bool need_verity;		/* need fs-verity verification after decompression? */
+
+	/* CoPack P1 runtime-only read state. */
+	bool copack;
+	bool copack_odd;
+	unsigned int copack_private_cpages;
+	block_t copack_blkaddr;
+
 	void *private;			/* payload buffer for specified decompression algorithm */
 	void *private2;			/* extra payload buffer */
 	struct work_struct verity_work;	/* work to verify the decompressed pages */
@@ -3278,10 +3291,15 @@ static inline void verify_blkaddr(struct f2fs_sb_info *sbi,
 	}
 }
 
+static inline bool f2fs_is_compress_marker(block_t blkaddr)
+{
+	return blkaddr == COMPRESS_ADDR || blkaddr == COPACK_ADDR;
+}
+
 static inline bool __is_valid_data_blkaddr(block_t blkaddr)
 {
 	if (blkaddr == NEW_ADDR || blkaddr == NULL_ADDR ||
-			blkaddr == COMPRESS_ADDR)
+			f2fs_is_compress_marker(blkaddr))
 		return false;
 	return true;
 }
@@ -4076,6 +4094,11 @@ int f2fs_write_multi_pages(struct compress_ctx *cc,
 						int *submitted,
 						struct writeback_control *wbc,
 						enum iostat_type io_type);
+int f2fs_write_copack_pair(struct compress_ctx *even,
+					struct compress_ctx *odd,
+					int *submitted,
+					struct writeback_control *wbc,
+					enum iostat_type io_type);
 int f2fs_is_compressed_cluster(struct inode *inode, pgoff_t index);
 void f2fs_update_extent_tree_range_compressed(struct inode *inode,
 				pgoff_t fofs, block_t blkaddr, unsigned int llen,
