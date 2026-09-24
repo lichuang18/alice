@@ -1504,7 +1504,7 @@ struct compress_ctx {
 	void *private;			/* payload buffer for specified compression algorithm */
 	void *private2;			/* extra payload buffer */
 
-	/* CoPack P1 runtime-only read state; never persisted on disk. */
+	/* CoPack runtime-only read state; never persisted on disk. */
 	bool copack;
 	bool copack_odd;
 	unsigned int copack_private_cpages;
@@ -1565,7 +1565,7 @@ struct decompress_io_ctx {
 	bool failed;			/* IO error occurred before decompression? */
 	bool need_verity;		/* need fs-verity verification after decompression? */
 
-	/* CoPack P1 runtime-only read state. */
+	/* CoPack runtime-only read state. */
 	bool copack;
 	bool copack_odd;
 	unsigned int copack_private_cpages;
@@ -3542,6 +3542,9 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 			block_t old_blkaddr, block_t *new_blkaddr,
 			struct f2fs_summary *sum, int type,
 			struct f2fs_io_info *fio);
+int f2fs_allocate_copack_run(struct f2fs_io_info *fio,
+			block_t *old_blkaddrs, struct f2fs_summary *sums,
+			unsigned int nr_blocks, block_t *new_blkaddrs);
 void f2fs_update_device_state(struct f2fs_sb_info *sbi, nid_t ino,
 					block_t blkaddr, unsigned int blkcnt);
 void f2fs_wait_on_page_writeback(struct page *page,

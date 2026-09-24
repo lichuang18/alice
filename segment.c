@@ -3448,6 +3448,94 @@ static int __get_segment_type(struct f2fs_io_info *fio)
 	return type;
 }
 
+/*
+ * Allocate a physically contiguous run for the hidden Co-Pack
+ * representation.  This is intentionally conservative: the run must fit in
+ * the current LFS curseg.  We do not search SSR holes or cross a segment
+ * boundary, because Co-Pack derives the hidden block address from adjacency.
+ *
+ * old_blkaddrs[] correspond one-to-one with the new blocks except for the
+ * hidden Co-Pack block, whose old address is NULL_ADDR.  sums[] contains the
+ * SSA entry for every new block; in particular the hidden Co-Pack block uses
+ * the even cluster's COPACK_ADDR slot as its reverse-mapping anchor.
+ */
+int f2fs_allocate_copack_run(struct f2fs_io_info *fio,
+		block_t *old_blkaddrs, struct f2fs_summary *sums,
+		unsigned int nr_blocks, block_t *new_blkaddrs)
+{
+	struct f2fs_sb_info *sbi = fio->sbi;
+	struct sit_info *sit_i = SIT_I(sbi);
+	struct curseg_info *curseg;
+	unsigned int usable;
+	int type;
+	unsigned int i;
+	int ret = 0;
+
+	if (!nr_blocks || !f2fs_lfs_mode(sbi) || F2FS_IO_ALIGNED(sbi))
+		return -EAGAIN;
+
+	/* This also fixes fio->temp to the data temperature used for submission. */
+	type = __get_segment_type(fio);
+	curseg = CURSEG_I(sbi, type);
+
+	down_read(&SM_I(sbi)->curseg_lock);
+	mutex_lock(&curseg->curseg_mutex);
+	down_write(&sit_i->sentry_lock);
+
+	usable = f2fs_usable_blks_in_seg(sbi, curseg->segno);
+	if (curseg->alloc_type != LFS ||
+			curseg->next_blkoff + nr_blocks > usable) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+
+	for (i = 0; i < nr_blocks; i++) {
+		block_t old = old_blkaddrs[i];
+		block_t new = NEXT_FREE_BLKADDR(sbi, curseg);
+
+		/* LFS + the preflight range check make this a strict run. */
+		if (i && new != new_blkaddrs[i - 1] + 1) {
+			f2fs_bug_on(sbi, true);
+			ret = -EFSCORRUPTED;
+			goto out_unlock;
+		}
+
+		f2fs_bug_on(sbi, curseg->next_blkoff >= usable);
+		f2fs_wait_discard_bio(sbi, new);
+		__add_sum_entry(sbi, type, &sums[i]);
+		__refresh_next_blkoff(sbi, curseg);
+		stat_inc_block_count(sbi, curseg);
+
+		if (GET_SEGNO(sbi, old) != NULL_SEGNO) {
+			update_segment_mtime(sbi, old, 0);
+			update_sit_entry(sbi, old, -1);
+			locate_dirty_segment(sbi, GET_SEGNO(sbi, old));
+			if (old != NULL_ADDR)
+				atomic64_inc(&sbi->mot2.update_path_invalid_blks_total);
+		}
+
+		update_segment_mtime(sbi, new, 0);
+		update_sit_entry(sbi, new, 1);
+		locate_dirty_segment(sbi, GET_SEGNO(sbi, new));
+		new_blkaddrs[i] = new;
+	}
+
+	/* Keep the normal curseg lifecycle when the run exactly fills it. */
+	if (!__has_curseg_space(sbi, curseg)) {
+		if (need_new_seg(sbi, type))
+			new_curseg(sbi, type, false);
+		else
+			change_curseg(sbi, type);
+		stat_inc_seg_type(sbi, curseg);
+	}
+
+out_unlock:
+	up_write(&sit_i->sentry_lock);
+	mutex_unlock(&curseg->curseg_mutex);
+	up_read(&SM_I(sbi)->curseg_lock);
+	return ret;
+}
+
 void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 		block_t old_blkaddr, block_t *new_blkaddr,
 		struct f2fs_summary *sum, int type,

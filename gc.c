@@ -1044,6 +1044,28 @@ static bool is_alive(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 
 	*nofs = ofs_of_node(node_page);
 	source_blkaddr = data_blkaddr(NULL, node_page, ofs_in_node);
+
+	/*
+	 * Hidden Co-Pack blocks deliberately reverse-map to the even cluster's
+	 * COPACK_ADDR marker, not to a slot containing their own blkaddr.
+	 * Validate the implicit relation while the node page is still locked.
+	 */
+	if (source_blkaddr == COPACK_ADDR) {
+		block_t last = NULL_ADDR;
+		unsigned int i;
+
+		for (i = ofs_in_node + 1; base + i < max_addrs; i++) {
+			block_t addr = data_blkaddr(NULL, node_page, i);
+
+			if (!__is_valid_data_blkaddr(addr))
+				break;
+			last = addr;
+		}
+		f2fs_put_page(node_page, 1);
+
+		return __is_valid_data_blkaddr(last) && last + 1 == blkaddr;
+	}
+
 	f2fs_put_page(node_page, 1);
 
 	if (source_blkaddr != blkaddr) {
@@ -1412,6 +1434,27 @@ out:
  * If the parent node is not valid or the data block address is different,
  * the victim data block is ignored.
  */
+/*
+ * P2 safety fence: until whole-pair relocation is implemented, do not move
+ * any block belonging to a COPACK_ADDR cluster.  This preserves the implicit
+ * adjacency invariant at the cost of making such blocks temporarily
+ * unmovable by GC.  Fresh/low-utilization P2 experiments should run with
+ * background_gc=off.
+ */
+static bool gc_block_belongs_to_copack(struct inode *inode, pgoff_t bidx)
+{
+	struct dnode_of_data dn;
+	pgoff_t start = round_down(bidx, F2FS_I(inode)->i_cluster_size);
+	bool ret = false;
+
+	set_new_dnode(&dn, inode, NULL, NULL, 0);
+	if (f2fs_get_dnode_of_data(&dn, start, LOOKUP_NODE))
+		return false;
+	ret = dn.data_blkaddr == COPACK_ADDR;
+	f2fs_put_dnode(&dn);
+	return ret;
+}
+
 static int gc_data_segment(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 		struct gc_inode_list *gc_list, unsigned int segno, int gc_type,
 		bool force_migrate)
@@ -1498,6 +1541,12 @@ next_step:
 
 			start_bidx = f2fs_start_bidx_of_node(nofs, inode) +
 								ofs_in_node;
+
+			if (gc_block_belongs_to_copack(inode, start_bidx)) {
+				up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
+				iput(inode);
+				continue;
+			}
 
 			if (f2fs_post_read_required(inode)) {
 				int err = ra_data_block(inode, start_bidx);

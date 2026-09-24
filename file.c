@@ -555,6 +555,29 @@ static int f2fs_file_open(struct inode *inode, struct file *filp)
 	return dquot_file_open(inode, filp);
 }
 
+static block_t f2fs_hidden_copack_from_node(struct inode *inode,
+			struct page *node_page, unsigned int marker_ofs)
+{
+	unsigned int cluster_size = F2FS_I(inode)->i_cluster_size;
+	block_t last = NULL_ADDR;
+	unsigned int i;
+
+	if (data_blkaddr(inode, node_page, marker_ofs) != COPACK_ADDR)
+		return NULL_ADDR;
+
+	for (i = 1; i < cluster_size; i++) {
+		block_t blkaddr = data_blkaddr(inode, node_page, marker_ofs + i);
+
+		if (!__is_valid_data_blkaddr(blkaddr))
+			break;
+		last = blkaddr;
+	}
+
+	if (!__is_valid_data_blkaddr(last))
+		return NULL_ADDR;
+	return last + 1;
+}
+
 void f2fs_truncate_data_blocks_range(struct dnode_of_data *dn, int count)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
@@ -565,6 +588,8 @@ void f2fs_truncate_data_blocks_range(struct dnode_of_data *dn, int count)
 	bool compressed_cluster = false;
 	int cluster_index = 0, valid_blocks = 0;
 	int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
+	pgoff_t node_fofs = f2fs_start_bidx_of_node(ofs_of_node(dn->node_page),
+							dn->inode);
 	bool released = !atomic_read(&F2FS_I(dn->inode)->i_compr_blocks);
 
 	if (IS_INODE(dn->node_page) && f2fs_has_extra_attr(dn->inode))
@@ -579,11 +604,29 @@ void f2fs_truncate_data_blocks_range(struct dnode_of_data *dn, int count)
 
 		if (f2fs_compressed_file(dn->inode) &&
 					!(cluster_index & (cluster_size - 1))) {
+			pgoff_t cidx = (node_fofs + dn->ofs_in_node) >>
+					F2FS_I(dn->inode)->i_log_cluster_size;
+
 			if (compressed_cluster)
 				f2fs_i_compr_blocks_update(dn->inode,
 							valid_blocks, false);
 			compressed_cluster = f2fs_is_compress_marker(blkaddr);
 			valid_blocks = 0;
+
+			/* The hidden block is physically owned/accounted by even. */
+			if (blkaddr == COPACK_ADDR && !(cidx & 1)) {
+				block_t hidden = f2fs_hidden_copack_from_node(
+					dn->inode, dn->node_page, dn->ofs_in_node);
+
+				if (__is_valid_data_blkaddr(hidden) &&
+						f2fs_is_valid_blkaddr(sbi, hidden,
+						DATA_GENERIC_ENHANCE)) {
+					f2fs_invalidate_blocks(sbi, hidden);
+					valid_blocks++;
+					if (released)
+						nr_free++;
+				}
+			}
 		}
 
 		if (blkaddr == NULL_ADDR)
@@ -3443,6 +3486,8 @@ static int release_compress_blocks(struct dnode_of_data *dn, pgoff_t count)
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
 	unsigned int released_blocks = 0;
 	int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
+	pgoff_t node_fofs = f2fs_start_bidx_of_node(ofs_of_node(dn->node_page),
+							dn->inode);
 	block_t blkaddr;
 	int i;
 
@@ -3459,6 +3504,10 @@ static int release_compress_blocks(struct dnode_of_data *dn, pgoff_t count)
 
 	while (count) {
 		int compr_blocks = 0;
+		unsigned int marker_ofs = dn->ofs_in_node;
+		pgoff_t cidx = (node_fofs + marker_ofs) >>
+				F2FS_I(dn->inode)->i_log_cluster_size;
+		block_t marker = data_blkaddr(dn->inode, dn->node_page, marker_ofs);
 
 		for (i = 0; i < cluster_size; i++, dn->ofs_in_node++) {
 			blkaddr = f2fs_data_blkaddr(dn);
@@ -3479,6 +3528,9 @@ static int release_compress_blocks(struct dnode_of_data *dn, pgoff_t count)
 			dn->data_blkaddr = NULL_ADDR;
 			f2fs_set_data_blkaddr(dn);
 		}
+
+		if (marker == COPACK_ADDR && !(cidx & 1))
+			compr_blocks++;
 
 		f2fs_i_compr_blocks_update(dn->inode, compr_blocks, false);
 		dec_valid_block_count(sbi, dn->inode,
@@ -3608,6 +3660,8 @@ static int reserve_compress_blocks(struct dnode_of_data *dn, pgoff_t count,
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
 	int cluster_size = F2FS_I(dn->inode)->i_cluster_size;
+	pgoff_t node_fofs = f2fs_start_bidx_of_node(ofs_of_node(dn->node_page),
+							dn->inode);
 	block_t blkaddr;
 	int i;
 
@@ -3624,6 +3678,10 @@ static int reserve_compress_blocks(struct dnode_of_data *dn, pgoff_t count,
 
 	while (count) {
 		int compr_blocks = 0;
+		unsigned int marker_ofs = dn->ofs_in_node;
+		pgoff_t cidx = (node_fofs + marker_ofs) >>
+				F2FS_I(dn->inode)->i_log_cluster_size;
+		block_t marker = data_blkaddr(dn->inode, dn->node_page, marker_ofs);
 		blkcnt_t reserved;
 		int ret;
 
@@ -3651,6 +3709,9 @@ static int reserve_compress_blocks(struct dnode_of_data *dn, pgoff_t count,
 			dn->data_blkaddr = NEW_ADDR;
 			f2fs_set_data_blkaddr(dn);
 		}
+
+		if (marker == COPACK_ADDR && !(cidx & 1))
+			compr_blocks++;
 
 		reserved = cluster_size - compr_blocks;
 

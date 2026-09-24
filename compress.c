@@ -17,6 +17,7 @@
 #include "f2fs.h"
 #include "node.h"
 #include "segment.h"
+#include "iostat.h"
 #include <trace/events/f2fs.h>
 
 static struct kmem_cache *cic_entry_slab;
@@ -784,7 +785,7 @@ void f2fs_decompress_cluster(struct decompress_io_ctx *dic)
 			goto out_end_io;
 	}
 
-	if (dic->copack && dic->copack_odd) {
+	if (dic->copack) {
 		struct compress_data *hdr;
 		void *first_addr, *last_addr;
 		size_t rep_size, tail_len;
@@ -808,7 +809,10 @@ void f2fs_decompress_cluster(struct decompress_io_ctx *dic)
 		tail_len = rep_size - dic->copack_private_cpages * PAGE_SIZE;
 
 		last_addr = kmap_local_page(dic->cpages[dic->nr_cpages - 1]);
-		memmove(last_addr, last_addr + PAGE_SIZE - tail_len, tail_len);
+		if (dic->copack_odd)
+			memmove(last_addr, last_addr + PAGE_SIZE - tail_len,
+				tail_len);
+		/* even tail is already stored at offset 0 in the shared block */
 		memset(last_addr + tail_len, 0, PAGE_SIZE - tail_len);
 		kunmap_local(last_addr);
 	}
@@ -1005,6 +1009,13 @@ static int __f2fs_cluster_blocks(struct inode *inode,
 		int i;
 
 		ret = 1;
+		/*
+		 * The hidden Co-Pack block has no node address slot.  Charge it
+		 * exactly once to the even anchor cluster for compressed-block
+		 * accounting; logical/reserved-block counting remains slot-based.
+		 */
+		if (compr && dn.data_blkaddr == COPACK_ADDR && !(cluster_idx & 1))
+			ret++;
 		for (i = 1; i < cluster_size; i++) {
 			block_t blkaddr;
 
@@ -1563,6 +1574,20 @@ out:
 }
 
 
+static bool f2fs_copack_cluster_on_disk(struct compress_ctx *cc)
+{
+	struct dnode_of_data dn;
+	pgoff_t start = start_idx_of_cluster(cc);
+	bool ret = false;
+
+	set_new_dnode(&dn, cc->inode, NULL, NULL, 0);
+	if (f2fs_get_dnode_of_data(&dn, start, LOOKUP_NODE))
+		return false;
+	ret = dn.data_blkaddr == COPACK_ADDR;
+	f2fs_put_dnode(&dn);
+	return ret;
+}
+
 static bool f2fs_copack_same_node_page(struct compress_ctx *even,
 				struct compress_ctx *odd)
 {
@@ -1584,7 +1609,7 @@ static bool f2fs_copack_same_node_page(struct compress_ctx *even,
 	if (ret)
 		return false;
 
-	/* Same nid is sufficient: both address ranges are in one node page. */
+	/* Keep P2 metadata updates on one node page. */
 	ret = odd_dn.nid == even_nid;
 	f2fs_put_dnode(&odd_dn);
 
@@ -1599,7 +1624,7 @@ static bool f2fs_copack_eligible(struct compress_ctx *even,
 	size_t even_rep = COMPRESS_HEADER_SIZE + even->clen;
 	size_t odd_rep = COMPRESS_HEADER_SIZE + odd->clen;
 
-	/* P1 deliberately excludes single-page compressed representations. */
+	/* Each side must retain at least one private compressed block. */
 	if (even->nr_cpages < 2 || odd->nr_cpages < 2)
 		return false;
 
@@ -1610,52 +1635,41 @@ static bool f2fs_copack_eligible(struct compress_ctx *even,
 	if (*even_tail + *odd_tail > PAGE_SIZE)
 		return false;
 
-	/* P1 does not support fscrypt pages sharing one physical page. */
+	/* A shared physical block cannot use two fscrypt IV domains. */
 	if (fscrypt_inode_uses_fs_layer_crypto(even->inode))
 		return false;
 
-	/* P1 read reconstruction uses the already-held node page. */
+	/* P2 keeps both cluster address ranges on one locked node page. */
 	if (!f2fs_copack_same_node_page(even, odd))
 		return false;
 
 	return true;
 }
 
-static int f2fs_copack_merge_tail(struct compress_ctx *even,
+static struct page *f2fs_copack_build_shared_page(struct compress_ctx *even,
 				struct compress_ctx *odd,
 				unsigned int even_tail,
 				unsigned int odd_tail)
 {
-	struct page **new_cpages;
-	struct page *odd_tail_page;
-	unsigned int old_nr = odd->nr_cpages;
-	void *even_addr, *odd_addr;
-	int i;
+	struct page *shared;
+	void *shared_addr, *even_addr, *odd_addr;
 
-	/* Allocate replacement metadata before changing either compressed stream. */
-	new_cpages = page_array_alloc(odd->inode, old_nr - 1);
-	if (!new_cpages)
-		return -ENOMEM;
+	shared = f2fs_compress_alloc_page();
+	if (!shared)
+		return NULL;
 
-	/* even's last cpage becomes the single shared page. */
+	shared_addr = kmap_local_page(shared);
 	even_addr = kmap_local_page(even->cpages[even->nr_cpages - 1]);
 	odd_addr = kmap_local_page(odd->cpages[odd->nr_cpages - 1]);
-	memset(even_addr + even_tail, 0,
-			PAGE_SIZE - even_tail - odd_tail);
-	memcpy(even_addr + PAGE_SIZE - odd_tail, odd_addr, odd_tail);
+
+	memset(shared_addr, 0, PAGE_SIZE);
+	memcpy(shared_addr, even_addr, even_tail);
+	memcpy(shared_addr + PAGE_SIZE - odd_tail, odd_addr, odd_tail);
+
 	kunmap_local(odd_addr);
 	kunmap_local(even_addr);
-
-	/* Remove odd's terminal cpage from its own write set. */
-	for (i = 0; i < old_nr - 1; i++)
-		new_cpages[i] = odd->cpages[i];
-
-	odd_tail_page = odd->cpages[old_nr - 1];
-	page_array_free(odd->inode, odd->cpages, old_nr);
-	odd->cpages = new_cpages;
-	odd->nr_cpages = old_nr - 1;
-	f2fs_compress_free_page(odd_tail_page);
-	return 0;
+	kunmap_local(shared_addr);
+	return shared;
 }
 
 static int f2fs_finish_pair_side(struct compress_ctx *cc, int comp_ret,
@@ -1683,12 +1697,388 @@ static int f2fs_finish_pair_side(struct compress_ctx *cc, int comp_ret,
 }
 
 /*
- * P1 conservative CoPack prototype.
+ * Write the final P2 representation:
  *
- * This version really shares the two terminal compressed fragments and is
- * readable, but deliberately keeps the shared page in the even cluster's
- * last compressed-address slot.  It is a test vehicle for end-to-end
- * correctness/benefit/overhead before the later hidden-block representation.
+ *   even private blocks | hidden Co-Pack block | odd private blocks
+ *
+ * The hidden block has no node address slot.  Its SSA summary points to the
+ * even cluster's COPACK_ADDR slot.  Both readers recover it from adjacency.
+ *
+ * P2 intentionally rejects an already-COPACK_ADDR pair.  Updating an existing
+ * hidden pair requires pair reconstruction/relocation and is a later step;
+ * rejecting it is safer than silently leaking or corrupting the old hidden
+ * block.  P2 tests therefore use fresh, write-once filesystems.
+ */
+static int f2fs_write_hidden_copack_pair(struct compress_ctx *even,
+				struct compress_ctx *odd,
+				unsigned int even_tail,
+				unsigned int odd_tail,
+				int *submitted,
+				struct writeback_control *wbc,
+				enum iostat_type io_type)
+{
+	struct inode *inode = even->inode;
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	struct f2fs_inode_info *fi = F2FS_I(inode);
+	struct dnode_of_data dn;
+	struct node_info ni;
+	struct compress_io_ctx *cic = NULL;
+	struct f2fs_io_info fio = {
+		.sbi = sbi,
+		.ino = inode->i_ino,
+		.type = DATA,
+		.op = REQ_OP_WRITE,
+		.op_flags = wbc_to_write_flags(wbc),
+		.old_blkaddr = NEW_ADDR,
+		.page = NULL,
+		.encrypted_page = NULL,
+		.compressed_page = NULL,
+		.submitted = 0,
+		.io_type = io_type,
+		.io_wbc = wbc,
+		.encrypted = 0,
+		.in_list = 0,
+	};
+	struct f2fs_summary *sums = NULL;
+	block_t *old_blks = NULL, *new_blks = NULL;
+	struct page *shared = NULL;
+	unsigned int even_private = even->nr_cpages - 1;
+	unsigned int odd_private = odd->nr_cpages - 1;
+	unsigned int run_blocks = even_private + 1 + odd_private;
+	unsigned int even_ofs, odd_ofs;
+	nid_t anchor_nid = 0;
+	pgoff_t pair_idx = even->cluster_idx >> 1;
+	unsigned int i, pos;
+	unsigned int old_even_phys = 0, old_odd_phys = 0;
+	pgoff_t even_start = start_idx_of_cluster(even);
+	loff_t psize;
+	bool noquota = IS_NOQUOTA(inode);
+	int err = -EAGAIN;
+
+	*submitted = 0;
+
+	if (unlikely(f2fs_cp_error(sbi)) || F2FS_IO_ALIGNED(sbi))
+		return -EAGAIN;
+
+	shared = f2fs_copack_build_shared_page(even, odd,
+						even_tail, odd_tail);
+	if (!shared)
+		return -EAGAIN;
+
+	old_blks = kcalloc(run_blocks, sizeof(*old_blks), GFP_NOFS);
+	new_blks = kcalloc(run_blocks, sizeof(*new_blks), GFP_NOFS);
+	sums = kcalloc(run_blocks, sizeof(*sums), GFP_NOFS);
+	if (!old_blks || !new_blks || !sums)
+		goto out_free_prealloc;
+
+	cic = f2fs_kmem_cache_alloc(cic_entry_slab, GFP_F2FS_ZERO,
+					false, sbi);
+	if (!cic)
+		goto out_free_prealloc;
+	cic->rpages = page_array_alloc(inode, even->cluster_size * 2);
+	if (!cic->rpages)
+		goto out_free_cic;
+
+	if (noquota)
+		down_read(&sbi->node_write);
+	else if (!f2fs_trylock_op(sbi))
+		goto out_free_cic_rpages;
+
+	set_new_dnode(&dn, inode, NULL, NULL, 0);
+	err = f2fs_get_dnode_of_data(&dn, even_start, LOOKUP_NODE);
+	if (err)
+		goto out_unlock_op;
+
+	even_ofs = dn.ofs_in_node;
+	odd_ofs = even_ofs + even->cluster_size;
+	if (odd_ofs + odd->cluster_size > ADDRS_PER_PAGE(dn.node_page, inode)) {
+		err = -EAGAIN;
+		goto out_put_dnode;
+	}
+
+	/* P2 on-disk semantics are intentionally incompatible with the P1 prototype. */
+	if (data_blkaddr(inode, dn.node_page, even_ofs) == COPACK_ADDR ||
+			data_blkaddr(inode, dn.node_page, odd_ofs) == COPACK_ADDR) {
+		err = -EOPNOTSUPP;
+		goto out_put_dnode;
+	}
+
+	for (i = 0; i < even->cluster_size; i++) {
+		if (data_blkaddr(inode, dn.node_page, even_ofs + i) == NULL_ADDR) {
+			err = -EAGAIN;
+			goto out_put_dnode;
+		}
+	}
+	for (i = 0; i < odd->cluster_size; i++) {
+		if (data_blkaddr(inode, dn.node_page, odd_ofs + i) == NULL_ADDR) {
+			err = -EAGAIN;
+			goto out_put_dnode;
+		}
+	}
+
+	err = f2fs_get_node_info(sbi, dn.nid, &ni, false);
+	if (err)
+		goto out_put_dnode;
+	fio.version = ni.version;
+	anchor_nid = dn.nid;
+
+	if (f2fs_is_compress_marker(data_blkaddr(inode, dn.node_page,
+						even_ofs))) {
+		for (i = 1; i < even->cluster_size; i++)
+			if (__is_valid_data_blkaddr(data_blkaddr(inode,
+					dn.node_page, even_ofs + i)))
+				old_even_phys++;
+	}
+	if (f2fs_is_compress_marker(data_blkaddr(inode, dn.node_page,
+						odd_ofs))) {
+		for (i = 1; i < odd->cluster_size; i++)
+			if (__is_valid_data_blkaddr(data_blkaddr(inode,
+					dn.node_page, odd_ofs + i)))
+				old_odd_phys++;
+	}
+
+	/* Build old-address and SSA-summary arrays in exact physical-run order. */
+	pos = 0;
+	for (i = 0; i < even_private; i++, pos++) {
+		old_blks[pos] = data_blkaddr(inode, dn.node_page,
+						even_ofs + i + 1);
+		set_summary(&sums[pos], dn.nid, even_ofs + i + 1, ni.version);
+	}
+
+	/* Hidden block: no node slot; reverse-map it to the even marker. */
+	old_blks[pos] = NULL_ADDR;
+	set_summary(&sums[pos], dn.nid, even_ofs, ni.version);
+	pos++;
+
+	for (i = 0; i < odd_private; i++, pos++) {
+		old_blks[pos] = data_blkaddr(inode, dn.node_page,
+						odd_ofs + i + 1);
+		set_summary(&sums[pos], dn.nid, odd_ofs + i + 1, ni.version);
+	}
+	f2fs_bug_on(sbi, pos != run_blocks);
+
+	/* fio.page is used only to select the normal compressed-data curseg. */
+	fio.page = even->rpages[1];
+	err = f2fs_allocate_copack_run(&fio, old_blks, sums,
+						run_blocks, new_blks);
+	if (err)
+		goto out_put_dnode;
+
+	/* Match the normal out-of-place path's old-block cache invalidation. */
+	for (i = 0; i < run_blocks; i++) {
+		if (GET_SEGNO(sbi, old_blks[i]) == NULL_SEGNO)
+			continue;
+		invalidate_mapping_pages(META_MAPPING(sbi),
+				old_blks[i], old_blks[i]);
+		f2fs_invalidate_compress_page(sbi, old_blks[i]);
+	}
+
+	/* From here onward the new run is committed; do not fall back to stock. */
+	cic->magic = F2FS_COMPRESSED_PAGE_MAGIC;
+	cic->inode = inode;
+	cic->nr_rpages = even->cluster_size + odd->cluster_size;
+	atomic_set(&cic->pending_pages, run_blocks);
+	for (i = 0; i < even->cluster_size; i++)
+		cic->rpages[i] = even->rpages[i];
+	for (i = 0; i < odd->cluster_size; i++)
+		cic->rpages[even->cluster_size + i] = odd->rpages[i];
+
+	/* All submitted pages must carry the pair-level completion context first. */
+	for (i = 0; i < even_private; i++)
+		f2fs_set_compressed_page(even->cpages[i], inode,
+					even->rpages[i + 1]->index, cic);
+	f2fs_set_compressed_page(shared, inode,
+				even->rpages[even->cluster_size - 1]->index, cic);
+	for (i = 0; i < odd_private; i++)
+		f2fs_set_compressed_page(odd->cpages[i], inode,
+					odd->rpages[i + 1]->index, cic);
+
+	set_cluster_writeback(even);
+	set_cluster_writeback(odd);
+
+	/* Invalidate old blocks which were not reused as private-slot predecessors. */
+	if (__is_valid_data_blkaddr(data_blkaddr(inode, dn.node_page, even_ofs)))
+		f2fs_invalidate_blocks(sbi,
+				data_blkaddr(inode, dn.node_page, even_ofs));
+	for (i = even_private + 1; i < even->cluster_size; i++) {
+		block_t old = data_blkaddr(inode, dn.node_page, even_ofs + i);
+		if (__is_valid_data_blkaddr(old))
+			f2fs_invalidate_blocks(sbi, old);
+	}
+	if (__is_valid_data_blkaddr(data_blkaddr(inode, dn.node_page, odd_ofs)))
+		f2fs_invalidate_blocks(sbi,
+				data_blkaddr(inode, dn.node_page, odd_ofs));
+	for (i = odd_private + 1; i < odd->cluster_size; i++) {
+		block_t old = data_blkaddr(inode, dn.node_page, odd_ofs + i);
+		if (__is_valid_data_blkaddr(old))
+			f2fs_invalidate_blocks(sbi, old);
+	}
+
+	/* Publish only private addresses.  The shared blkaddr remains implicit. */
+	dn.ofs_in_node = even_ofs;
+	dn.data_blkaddr = COPACK_ADDR;
+	f2fs_set_data_blkaddr(&dn);
+	for (i = 0; i < even_private; i++) {
+		dn.ofs_in_node = even_ofs + i + 1;
+		dn.data_blkaddr = new_blks[i];
+		f2fs_set_data_blkaddr(&dn);
+	}
+	for (i = even_private + 1; i < even->cluster_size; i++) {
+		dn.ofs_in_node = even_ofs + i;
+		dn.data_blkaddr = NEW_ADDR;
+		f2fs_set_data_blkaddr(&dn);
+	}
+
+	dn.ofs_in_node = odd_ofs;
+	dn.data_blkaddr = COPACK_ADDR;
+	f2fs_set_data_blkaddr(&dn);
+	for (i = 0; i < odd_private; i++) {
+		dn.ofs_in_node = odd_ofs + i + 1;
+		dn.data_blkaddr = new_blks[even_private + 1 + i];
+		f2fs_set_data_blkaddr(&dn);
+	}
+	for (i = odd_private + 1; i < odd->cluster_size; i++) {
+		dn.ofs_in_node = odd_ofs + i;
+		dn.data_blkaddr = NEW_ADDR;
+		f2fs_set_data_blkaddr(&dn);
+	}
+
+	/* CoPack has its own read semantics; do not leave a stale normal extent. */
+	dn.ofs_in_node = even_ofs;
+	f2fs_update_extent_cache_range(&dn, even_start, NULL_ADDR,
+				even->cluster_size + odd->cluster_size);
+
+	/* The two old terminal cpages are replaced by the new hidden shared page. */
+	f2fs_compress_free_page(even->cpages[even->nr_cpages - 1]);
+	even->cpages[even->nr_cpages - 1] = NULL;
+	f2fs_compress_free_page(odd->cpages[odd->nr_cpages - 1]);
+	odd->cpages[odd->nr_cpages - 1] = NULL;
+
+	/* Submit in exact run order: even-private, hidden shared, odd-private. */
+	pos = 0;
+	for (i = 0; i < even_private; i++, pos++) {
+		struct page *cpage = even->cpages[i];
+		even->cpages[i] = NULL;
+		fio.page = even->rpages[i + 1];
+		fio.compressed_page = cpage;
+		fio.old_blkaddr = old_blks[pos];
+		fio.new_blkaddr = new_blks[pos];
+		fio.retry = 0;
+		f2fs_submit_page_write(&fio);
+		f2fs_update_device_state(sbi, inode->i_ino, fio.new_blkaddr, 1);
+		f2fs_update_iostat(sbi, io_type, F2FS_BLKSIZE);
+		(*submitted)++;
+	}
+
+	fio.page = even->rpages[even->cluster_size - 1];
+	fio.compressed_page = shared;
+	fio.old_blkaddr = NULL_ADDR;
+	fio.new_blkaddr = new_blks[pos];
+	fio.retry = 0;
+	f2fs_submit_page_write(&fio);
+	f2fs_update_device_state(sbi, inode->i_ino, fio.new_blkaddr, 1);
+	f2fs_update_iostat(sbi, io_type, F2FS_BLKSIZE);
+	(*submitted)++;
+	shared = NULL;
+	pos++;
+
+	for (i = 0; i < odd_private; i++, pos++) {
+		struct page *cpage = odd->cpages[i];
+		odd->cpages[i] = NULL;
+		fio.page = odd->rpages[i + 1];
+		fio.compressed_page = cpage;
+		fio.old_blkaddr = old_blks[pos];
+		fio.new_blkaddr = new_blks[pos];
+		fio.retry = 0;
+		f2fs_submit_page_write(&fio);
+		f2fs_update_device_state(sbi, inode->i_ino, fio.new_blkaddr, 1);
+		f2fs_update_iostat(sbi, io_type, F2FS_BLKSIZE);
+		(*submitted)++;
+	}
+	f2fs_bug_on(sbi, pos != run_blocks);
+
+	/* Remove old compression accounting, then charge the shared block once. */
+	if (old_even_phys)
+		f2fs_i_compr_blocks_update(inode, old_even_phys, false);
+	if (old_odd_phys)
+		f2fs_i_compr_blocks_update(inode, old_odd_phys, false);
+	f2fs_i_compr_blocks_update(inode, even_private + 1, true);
+	f2fs_i_compr_blocks_update(inode, odd_private, true);
+	add_compr_block_stat(inode, even_private + 1);
+	add_compr_block_stat(inode, odd_private);
+
+	for (i = 0; i < even->cluster_size; i++) {
+		inode_dec_dirty_pages(inode);
+		unlock_page(even->rpages[i]);
+	}
+	for (i = 0; i < odd->cluster_size; i++) {
+		inode_dec_dirty_pages(inode);
+		unlock_page(odd->rpages[i]);
+	}
+
+	set_inode_flag(inode, FI_APPEND_WRITE);
+	if (even->cluster_idx == 0)
+		set_inode_flag(inode, FI_FIRST_BLOCK_WRITTEN);
+
+	psize = (loff_t)(odd->rpages[odd->cluster_size - 1]->index + 1)
+							<< PAGE_SHIFT;
+
+	f2fs_put_dnode(&dn);
+	if (noquota)
+		up_read(&sbi->node_write);
+	else
+		f2fs_unlock_op(sbi);
+
+	spin_lock(&fi->i_size_lock);
+	if (fi->last_disk_size < psize)
+		fi->last_disk_size = psize;
+	spin_unlock(&fi->i_size_lock);
+
+	f2fs_put_rpages(even);
+	f2fs_put_rpages(odd);
+	page_array_free(inode, even->cpages, even->nr_cpages);
+	page_array_free(inode, odd->cpages, odd->nr_cpages);
+	even->cpages = NULL;
+	odd->cpages = NULL;
+	f2fs_destroy_compress_ctx(even, false);
+	f2fs_destroy_compress_ctx(odd, false);
+
+	pr_info_ratelimited("COPACK_P2 ino=%lu pair=%lu run=%u shared=%u "
+			"even_last=%u odd_first=%u anchor=(%u,%u) saved=1\n",
+		inode->i_ino, pair_idx, run_blocks, new_blks[even_private],
+		new_blks[even_private - 1], new_blks[even_private + 1],
+		anchor_nid, even_ofs);
+
+	kfree(sums);
+	kfree(new_blks);
+	kfree(old_blks);
+	return 0;
+
+out_put_dnode:
+	f2fs_put_dnode(&dn);
+out_unlock_op:
+	if (noquota)
+		up_read(&sbi->node_write);
+	else
+		f2fs_unlock_op(sbi);
+out_free_cic_rpages:
+	page_array_free(inode, cic->rpages, even->cluster_size * 2);
+out_free_cic:
+	kmem_cache_free(cic_entry_slab, cic);
+out_free_prealloc:
+	kfree(sums);
+	kfree(new_blks);
+	kfree(old_blks);
+	if (shared)
+		f2fs_compress_free_page(shared);
+	return err;
+}
+
+/*
+ * P2 hidden Co-Pack prototype.  Compression itself remains conservative:
+ * both clusters must first succeed under native F2FS.  The representation,
+ * however, is now the final hidden-block shape needed for later rescue:
+ * private-even | hidden-shared | private-odd.
  */
 int f2fs_write_copack_pair(struct compress_ctx *even,
 				struct compress_ctx *odd,
@@ -1698,12 +2088,21 @@ int f2fs_write_copack_pair(struct compress_ctx *even,
 {
 	unsigned int even_tail = 0, odd_tail = 0;
 	unsigned int stock_blocks, copack_blocks;
-	pgoff_t pair_idx = even->cluster_idx >> 1;
 	int even_ret, odd_ret;
 	int even_submitted = 0, odd_submitted = 0;
 	int ret = 0, err;
 
 	*submitted = 0;
+
+	/* P2 is write-once: refuse overwrite of an existing hidden pair. */
+	if (f2fs_copack_cluster_on_disk(even) ||
+			f2fs_copack_cluster_on_disk(odd)) {
+		f2fs_put_rpages_wbc(even, wbc, true, 1);
+		f2fs_destroy_compress_ctx(even, false);
+		f2fs_put_rpages_wbc(odd, wbc, true, 1);
+		f2fs_destroy_compress_ctx(odd, false);
+		return -EOPNOTSUPP;
+	}
 
 	if (!cluster_may_compress(even) || !cluster_may_compress(odd))
 		goto stock_pair;
@@ -1724,57 +2123,37 @@ int f2fs_write_copack_pair(struct compress_ctx *even,
 		return ret;
 	}
 
-	if (!f2fs_copack_eligible(even, odd, &even_tail, &odd_tail)) {
-		err = f2fs_write_compressed_pages(even, &even_submitted,
-						wbc, io_type, COMPRESS_ADDR);
-		if (err)
-			ret = err;
-		err = f2fs_write_compressed_pages(odd, &odd_submitted,
-						wbc, io_type, COMPRESS_ADDR);
-		if (!ret && err)
-			ret = err;
-		*submitted = even_submitted + odd_submitted;
-		return ret;
-	}
+	if (!f2fs_copack_eligible(even, odd, &even_tail, &odd_tail))
+		goto stock_compressed;
 
 	stock_blocks = even->nr_cpages + odd->nr_cpages;
-	err = f2fs_copack_merge_tail(even, odd, even_tail, odd_tail);
-	if (err) {
-		/* Compression succeeded; if metadata allocation fails, use stock. */
-		err = f2fs_write_compressed_pages(even, &even_submitted,
-						wbc, io_type, COMPRESS_ADDR);
-		if (err)
-			ret = err;
-		err = f2fs_write_compressed_pages(odd, &odd_submitted,
-						wbc, io_type, COMPRESS_ADDR);
-		if (!ret && err)
-			ret = err;
-		*submitted = even_submitted + odd_submitted;
-		return ret;
+	copack_blocks = (even->nr_cpages - 1) + 1 + (odd->nr_cpages - 1);
+
+	err = f2fs_write_hidden_copack_pair(even, odd,
+				even_tail, odd_tail, submitted, wbc, io_type);
+	if (!err) {
+		f2fs_bug_on(F2FS_I_SB(even->inode),
+				stock_blocks != copack_blocks + 1);
+		return 0;
+	}
+	if (err != -EAGAIN) {
+		f2fs_put_rpages_wbc(even, wbc, true, 1);
+		f2fs_destroy_compress_ctx(even, false);
+		f2fs_put_rpages_wbc(odd, wbc, true, 1);
+		f2fs_destroy_compress_ctx(odd, false);
+		return err;
 	}
 
-	copack_blocks = even->nr_cpages + odd->nr_cpages;
-
-	/*
-	 * Write even first: its last mapped cpage is the shared block.  Odd uses
-	 * COPACK_ADDR too, but stores only its private cpages.  The read path
-	 * derives odd's shared page from the fixed even sibling.
-	 */
+stock_compressed:
 	err = f2fs_write_compressed_pages(even, &even_submitted,
-					wbc, io_type, COPACK_ADDR);
+						wbc, io_type, COMPRESS_ADDR);
 	if (err)
 		ret = err;
 	err = f2fs_write_compressed_pages(odd, &odd_submitted,
-					wbc, io_type, COPACK_ADDR);
+						wbc, io_type, COMPRESS_ADDR);
 	if (!ret && err)
 		ret = err;
-
 	*submitted = even_submitted + odd_submitted;
-	if (!ret)
-		pr_info_ratelimited("COPACK_P1 ino=%lu pair=%lu tails=%u+%u stock=%u copack=%u saved=%u\n",
-			even->inode->i_ino, pair_idx,
-			even_tail, odd_tail, stock_blocks, copack_blocks,
-			stock_blocks - copack_blocks);
 	return ret;
 
 stock_pair:
@@ -1796,6 +2175,11 @@ int f2fs_write_multi_pages(struct compress_ctx *cc,
 	int err;
 
 	*submitted = 0;
+	if (f2fs_copack_cluster_on_disk(cc)) {
+		f2fs_put_rpages_wbc(cc, wbc, true, 1);
+		f2fs_destroy_compress_ctx(cc, false);
+		return -EOPNOTSUPP;
+	}
 	if (cluster_may_compress(cc)) {
 		err = f2fs_compress_pages(cc);
 		if (err == -EAGAIN) {

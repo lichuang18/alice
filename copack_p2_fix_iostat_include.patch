@@ -1,0 +1,12 @@
+diff --git a/compress.c b/compress.c
+--- a/compress.c
++++ b/compress.c
+@@ -15,6 +15,7 @@
+
+ #include "f2fs.h"
+ #include "node.h"
+ #include "segment.h"
++#include "iostat.h"
+ #include <trace/events/f2fs.h>
+
+ static struct kmem_cache *cic_entry_slab;

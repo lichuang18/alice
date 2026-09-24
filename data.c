@@ -2026,7 +2026,7 @@ next:
 		goto out;
 
 skip_fill:
-	if (map.m_pblk == COMPRESS_ADDR) {
+	if (f2fs_is_compress_marker(map.m_pblk)) {
 		compr_cluster = true;
 		count_in_cluster = 1;
 	} else if (compr_appended) {
@@ -2201,49 +2201,47 @@ out:
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 /*
- * Conservative CoPack P1 stores the shared page in the even sibling's last
- * compressed-address slot.  The odd sibling derives it from that fixed
- * partner instead of storing a second mapping.
+ * Hidden Co-Pack read locator.
+ *
+ * The shared block is not present in a node address slot.  COPACK_ADDR marks
+ * the representation, while physical adjacency makes its blkaddr implicit:
+ *
+ *   even cluster: shared = last_private + 1
+ *   odd  cluster: shared = first_private - 1
+ *
+ * The result is always validated as a real data blkaddr before use.
  */
-static int f2fs_copack_get_shared_blkaddr(struct dnode_of_data *odd_dn,
-			pgoff_t odd_cluster_idx, block_t *shared)
+static int f2fs_copack_get_shared_blkaddr(struct dnode_of_data *dn,
+			pgoff_t cluster_idx, unsigned int nr_private,
+			block_t *shared)
 {
-	unsigned int cluster_size = F2FS_I(odd_dn->inode)->i_cluster_size;
-	unsigned int even_ofs;
-	block_t last = NULL_ADDR;
-	int i;
+	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
+	block_t edge;
 
-	if (!(odd_cluster_idx & 1) || odd_cluster_idx == 0)
-		return -EINVAL;
-
-	/*
-	 * f2fs_read_multi_pages() already holds odd_dn->node_page locked.
-	 * Do not call f2fs_get_dnode_of_data() again for the even sibling here:
-	 * when both clusters share the same node page that recursively waits on
-	 * the very page we already hold and deadlocks.  P1 therefore only
-	 * accepts CoPack pairs whose two cluster markers live in one node page.
-	 */
-	if (odd_dn->ofs_in_node < cluster_size)
+	if (!nr_private || dn->data_blkaddr != COPACK_ADDR)
 		return -EFSCORRUPTED;
 
-	even_ofs = odd_dn->ofs_in_node - cluster_size;
-	if (data_blkaddr(odd_dn->inode, odd_dn->node_page, even_ofs) !=
-			COPACK_ADDR)
+	if (cluster_idx & 1)
+		edge = data_blkaddr(dn->inode, dn->node_page,
+					dn->ofs_in_node + 1);
+	else
+		edge = data_blkaddr(dn->inode, dn->node_page,
+					dn->ofs_in_node + nr_private);
+
+	if (!__is_valid_data_blkaddr(edge))
 		return -EFSCORRUPTED;
 
-	for (i = 1; i < cluster_size; i++) {
-		block_t blkaddr = data_blkaddr(odd_dn->inode, odd_dn->node_page,
-					even_ofs + i);
-
-		if (!__is_valid_data_blkaddr(blkaddr))
-			break;
-		last = blkaddr;
+	if (cluster_idx & 1) {
+		if (edge == MAIN_BLKADDR(sbi))
+			return -EFSCORRUPTED;
+		*shared = edge - 1;
+	} else {
+		*shared = edge + 1;
 	}
 
-	if (!__is_valid_data_blkaddr(last))
+	if (!f2fs_is_valid_blkaddr(sbi, *shared, DATA_GENERIC_ENHANCE_READ))
 		return -EFSCORRUPTED;
 
-	*shared = last;
 	return 0;
 }
 
@@ -2294,9 +2292,9 @@ int f2fs_read_multi_pages(struct compress_ctx *cc, struct bio **bio_ret,
 		goto out;
 
 	/*
-	 * P1 always reads the dnode so COPACK_ADDR can be distinguished from
-	 * stock COMPRESS_ADDR.  Re-enable the compressed extent-cache fast path
-	 * after CoPack extent semantics are defined.
+	 * CoPack reads the dnode so COPACK_ADDR can be distinguished from stock
+	 * COMPRESS_ADDR and the private edge blkaddr can be used to derive the
+	 * hidden shared block.  Keep the compressed extent-cache shortcut off.
 	 */
 	from_dnode = true;
 
@@ -2336,13 +2334,13 @@ skip_reading_dnode:
 			break;
 	}
 
-	if (cc->copack && cc->copack_odd) {
+	if (cc->copack) {
 		cc->copack_private_cpages = cc->nr_cpages;
 		ret = f2fs_copack_get_shared_blkaddr(&dn, cc->cluster_idx,
-						&cc->copack_blkaddr);
+				cc->copack_private_cpages, &cc->copack_blkaddr);
 		if (ret)
 			goto out_put_dnode;
-		/* The missing terminal compressed page is reconstructed from shared. */
+		/* The hidden shared block reconstructs one terminal cpage. */
 		cc->nr_cpages++;
 	}
 
@@ -2363,8 +2361,7 @@ skip_reading_dnode:
 		block_t blkaddr;
 		struct bio_post_read_ctx *ctx;
 
-		if (cc->copack && cc->copack_odd &&
-				i == cc->copack_private_cpages)
+		if (cc->copack && i == cc->copack_private_cpages)
 			blkaddr = cc->copack_blkaddr;
 		else
 			blkaddr = from_dnode ? data_blkaddr(dn.inode, dn.node_page,
@@ -2832,7 +2829,7 @@ got_it:
 	set_page_writeback(page);
 	ClearPageError(page);
 
-	if (fio->compr_blocks && fio->old_blkaddr == COMPRESS_ADDR)
+	if (fio->compr_blocks && f2fs_is_compress_marker(fio->old_blkaddr))
 		f2fs_i_compr_blocks_update(inode, fio->compr_blocks - 1, false);
 
 	/* LFS mode write path */
