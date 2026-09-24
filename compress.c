@@ -158,6 +158,7 @@ void f2fs_destroy_compress_ctx(struct compress_ctx *cc, bool reuse)
 	cc->copack_odd = false;
 	cc->copack_private_cpages = 0;
 	cc->copack_blkaddr = NULL_ADDR;
+	cc->copack_rescue_try = false;
 	if (!reuse)
 		cc->cluster_idx = NULL_CLUSTER;
 }
@@ -173,6 +174,26 @@ void f2fs_compress_ctx_add_page(struct compress_ctx *cc, struct page *page)
 	cc->rpages[cluster_ofs] = page;
 	cc->nr_rpages++;
 	cc->cluster_idx = cluster_idx(cc, page->index);
+}
+
+/*
+ * Native F2FS keeps a compressed cluster only if it fits in N-1 pages,
+ * because the cluster-start slot is occupied by COMPRESS_ADDR.  A hidden
+ * Co-Pack block removes that representation limit for the pair path: each
+ * cluster may keep N-1 private pages and place only its terminal fragment in
+ * the hidden shared block.  Therefore P3 lets the codec produce a candidate
+ * up to the original N-page logical size, but only while evaluating a CoPack
+ * pair.  Stock single-cluster compression retains the original N-1-page
+ * budget.
+ */
+static unsigned int f2fs_compress_payload_budget(struct compress_ctx *cc)
+{
+	unsigned int pages = cc->cluster_size - 1;
+
+	if (cc->copack_rescue_try)
+		pages = cc->cluster_size;
+
+	return pages * PAGE_SIZE - COMPRESS_HEADER_SIZE;
 }
 
 #ifdef CONFIG_F2FS_FS_LZO
@@ -257,7 +278,7 @@ static int lz4_init_compress_ctx(struct compress_ctx *cc)
 	 * adapt worst compress case, because lz4 compressor can handle
 	 * output budget properly.
 	 */
-	cc->clen = cc->rlen - PAGE_SIZE - COMPRESS_HEADER_SIZE;
+	cc->clen = f2fs_compress_payload_budget(cc);
 	return 0;
 }
 
@@ -369,7 +390,7 @@ static int zstd_init_compress_ctx(struct compress_ctx *cc)
 	cc->private = workspace;
 	cc->private2 = stream;
 
-	cc->clen = cc->rlen - PAGE_SIZE - COMPRESS_HEADER_SIZE;
+	cc->clen = f2fs_compress_payload_budget(cc);
 	return 0;
 }
 
@@ -386,7 +407,7 @@ static int zstd_compress_pages(struct compress_ctx *cc)
 	ZSTD_inBuffer inbuf;
 	ZSTD_outBuffer outbuf;
 	int src_size = cc->rlen;
-	int dst_size = src_size - PAGE_SIZE - COMPRESS_HEADER_SIZE;
+	int dst_size = cc->clen;
 	int ret;
 
 	inbuf.pos = 0;
@@ -669,7 +690,7 @@ static int f2fs_compress_pages(struct compress_ctx *cc)
 	if (ret)
 		goto out_vunmap_cbuf;
 
-	max_len = PAGE_SIZE * (cc->cluster_size - 1) - COMPRESS_HEADER_SIZE;
+	max_len = f2fs_compress_payload_budget(cc);
 
 	if (cc->clen > max_len) {
 		ret = -EAGAIN;
@@ -1624,8 +1645,15 @@ static bool f2fs_copack_eligible(struct compress_ctx *even,
 	size_t even_rep = COMPRESS_HEADER_SIZE + even->clen;
 	size_t odd_rep = COMPRESS_HEADER_SIZE + odd->clen;
 
-	/* Each side must retain at least one private compressed block. */
+	/*
+	 * Each side must retain at least one private compressed block.  P3 may
+	 * additionally carry a rescue candidate with nr_cpages == cluster_size,
+	 * but never a representation larger than the original logical cluster.
+	 */
 	if (even->nr_cpages < 2 || odd->nr_cpages < 2)
+		return false;
+	if (even->nr_cpages > even->cluster_size ||
+			odd->nr_cpages > odd->cluster_size)
 		return false;
 
 	*even_tail = even_rep & (PAGE_SIZE - 1);
@@ -1672,6 +1700,24 @@ static struct page *f2fs_copack_build_shared_page(struct compress_ctx *even,
 	return shared;
 }
 
+static void f2fs_copack_drop_cpages(struct compress_ctx *cc)
+{
+	int i;
+
+	if (!cc->cpages)
+		return;
+
+	for (i = 0; i < cc->nr_cpages; i++) {
+		if (!cc->cpages[i])
+			continue;
+		f2fs_compress_free_page(cc->cpages[i]);
+		cc->cpages[i] = NULL;
+	}
+	page_array_free(cc->inode, cc->cpages, cc->nr_cpages);
+	cc->cpages = NULL;
+	cc->nr_cpages = 0;
+}
+
 static int f2fs_finish_pair_side(struct compress_ctx *cc, int comp_ret,
 				int *submitted,
 				struct writeback_control *wbc,
@@ -1679,11 +1725,20 @@ static int f2fs_finish_pair_side(struct compress_ctx *cc, int comp_ret,
 {
 	int err;
 
-	if (!comp_ret)
+	/*
+	 * A successful full-budget candidate is still not a valid native F2FS
+	 * compressed representation when it consumes cluster_size pages.  Such a
+	 * result is useful only if the pair is actually CoPacked; otherwise fall
+	 * back to the original raw cluster.
+	 */
+	if (!comp_ret && cc->nr_cpages < cc->cluster_size)
 		return f2fs_write_compressed_pages(cc, submitted, wbc, io_type,
 						COMPRESS_ADDR);
 
-	if (comp_ret == -EAGAIN) {
+	if (!comp_ret)
+		f2fs_copack_drop_cpages(cc);
+
+	if (!comp_ret || comp_ret == -EAGAIN) {
 		add_compr_block_stat(cc->inode, cc->cluster_size);
 		err = f2fs_write_raw_pages(cc, submitted, wbc, io_type);
 		f2fs_put_rpages_wbc(cc, wbc, false, 0);
@@ -1750,6 +1805,8 @@ static int f2fs_write_hidden_copack_pair(struct compress_ctx *even,
 	pgoff_t pair_idx = even->cluster_idx >> 1;
 	unsigned int i, pos;
 	unsigned int old_even_phys = 0, old_odd_phys = 0;
+	bool even_rescue = even->nr_cpages == even->cluster_size;
+	bool odd_rescue = odd->nr_cpages == odd->cluster_size;
 	pgoff_t even_start = start_idx_of_cluster(even);
 	loff_t psize;
 	bool noquota = IS_NOQUOTA(inode);
@@ -2043,9 +2100,15 @@ static int f2fs_write_hidden_copack_pair(struct compress_ctx *even,
 	f2fs_destroy_compress_ctx(even, false);
 	f2fs_destroy_compress_ctx(odd, false);
 
-	pr_info_ratelimited("COPACK_P2 ino=%lu pair=%lu run=%u shared=%u "
+	/*
+	 * Keep P3 success logging non-ratelimited during bring-up so a one-file
+	 * test can compare the exact pair count with P2.  Disable this printk
+	 * before performance measurements.
+	 */
+	pr_info("COPACK_P3 ino=%lu pair=%lu mode=%c%c run=%u shared=%u "
 			"even_last=%u odd_first=%u anchor=(%u,%u) saved=1\n",
-		inode->i_ino, pair_idx, run_blocks, new_blks[even_private],
+		inode->i_ino, pair_idx, even_rescue ? 'R' : 'N',
+		odd_rescue ? 'R' : 'N', run_blocks, new_blks[even_private],
 		new_blks[even_private - 1], new_blks[even_private + 1],
 		anchor_nid, even_ofs);
 
@@ -2075,10 +2138,10 @@ out_free_prealloc:
 }
 
 /*
- * P2 hidden Co-Pack prototype.  Compression itself remains conservative:
- * both clusters must first succeed under native F2FS.  The representation,
- * however, is now the final hidden-block shape needed for later rescue:
- * private-even | hidden-shared | private-odd.
+ * P3 hidden Co-Pack with compression rescue.  Only the pair path temporarily
+ * relaxes the codec output budget from N-1 pages to N pages.  A candidate
+ * that still needs N pages is never written as a native compressed cluster;
+ * it is retained only when tail sharing makes the pair strictly smaller.
  */
 int f2fs_write_copack_pair(struct compress_ctx *even,
 				struct compress_ctx *odd,
@@ -2107,6 +2170,13 @@ int f2fs_write_copack_pair(struct compress_ctx *even,
 	if (!cluster_may_compress(even) || !cluster_may_compress(odd))
 		goto stock_pair;
 
+	/*
+	 * Let the pair path observe representations in the native threshold-loss
+	 * region (for a 4-page cluster: roughly 12--16 KiB).  Stock single-cluster
+	 * compression still uses the original N-1-page budget.
+	 */
+	even->copack_rescue_try = true;
+	odd->copack_rescue_try = true;
 	even_ret = f2fs_compress_pages(even);
 	odd_ret = f2fs_compress_pages(odd);
 
@@ -2145,12 +2215,15 @@ int f2fs_write_copack_pair(struct compress_ctx *even,
 	}
 
 stock_compressed:
-	err = f2fs_write_compressed_pages(even, &even_submitted,
-						wbc, io_type, COMPRESS_ADDR);
+	/*
+	 * Native-sized candidates (< cluster_size pages) keep the normal compressed
+	 * representation.  Rescue-only candidates (== cluster_size pages) must go
+	 * back to raw if CoPack cannot be committed.
+	 */
+	err = f2fs_finish_pair_side(even, 0, &even_submitted, wbc, io_type);
 	if (err)
 		ret = err;
-	err = f2fs_write_compressed_pages(odd, &odd_submitted,
-						wbc, io_type, COMPRESS_ADDR);
+	err = f2fs_finish_pair_side(odd, 0, &odd_submitted, wbc, io_type);
 	if (!ret && err)
 		ret = err;
 	*submitted = even_submitted + odd_submitted;

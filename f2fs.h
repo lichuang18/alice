@@ -1509,6 +1509,9 @@ struct compress_ctx {
 	bool copack_odd;
 	unsigned int copack_private_cpages;
 	block_t copack_blkaddr;
+
+	/* Write-side only: allow a full-cluster compression candidate for rescue. */
+	bool copack_rescue_try;
 };
 
 /* compress context for write IO path */
