@@ -1,0 +1,243 @@
+From 5ca89b62c68b1c6fb92c4112e44315f4146ba182 Mon Sep 17 00:00:00 2001
+From: CoPack <copack@example.com>
+Date: Thu, 24 Sep 2026 05:59:01 +0000
+Subject: [PATCH] f2fs: copack: gather fixed adjacent compression clusters
+
+---
+ data.c | 159 ++++++++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 136 insertions(+), 23 deletions(-)
+
+diff --git a/data.c b/data.c
+index 6798efd..ed283b5 100644
+--- a/data.c
++++ b/data.c
+@@ -2977,6 +2977,60 @@ out:
+ 						wbc, FS_DATA_IO, 0, true);
+ }
+ 
++#ifdef CONFIG_F2FS_FS_COMPRESSION
++/*
++ * CoPack P0 only changes the aggregation boundary.  The two clusters are
++ * still written with the stock per-cluster path.  Keep this helper small so
++ * the later CoPack pair writer can replace the body without perturbing the
++ * page-cache scan again.
++ */
++static int f2fs_flush_copack_pair(struct compress_ctx cc[2],
++					int *submitted,
++					struct writeback_control *wbc,
++					enum iostat_type io_type)
++{
++	struct f2fs_sb_info *sbi = F2FS_I_SB(cc[0].inode);
++	int total_submitted = 0;
++	int first_err = 0;
++	int slot;
++
++	/*
++	 * If both sides are present, they must be the fixed sibling pair
++	 * (C2k, C2k+1).  Fail loudly during P0 if aggregation is ever mixed.
++	 */
++	if (!f2fs_cluster_is_empty(&cc[0]) &&
++			!f2fs_cluster_is_empty(&cc[1])) {
++		f2fs_bug_on(sbi, cc[0].cluster_idx & 1);
++		f2fs_bug_on(sbi, !(cc[1].cluster_idx & 1));
++		f2fs_bug_on(sbi, (cc[0].cluster_idx >> 1) !=
++					(cc[1].cluster_idx >> 1));
++	}
++
++	for (slot = 0; slot < 2; slot++) {
++		int nr_submitted = 0;
++		int err;
++
++		if (f2fs_cluster_is_empty(&cc[slot]))
++			continue;
++
++		err = f2fs_write_multi_pages(&cc[slot], &nr_submitted,
++						wbc, io_type);
++		total_submitted += nr_submitted;
++
++		/*
++		 * Always drain both contexts.  Pages kept in the second context
++		 * are locked and hold references, so returning after the first
++		 * error would strand them.  Preserve the first error for the caller.
++		 */
++		if (!first_err && err)
++			first_err = err;
++	}
++
++	*submitted = total_submitted;
++	return first_err;
++}
++#endif
++
+ /*
+  * This function was copied from write_cache_pages from mm/page-writeback.c.
+  * The major change is making write step of cold data page separately from
+@@ -2994,19 +3048,35 @@ static int f2fs_write_cache_pages(struct address_space *mapping,
+ 	sector_t last_block;
+ #ifdef CONFIG_F2FS_FS_COMPRESSION
+ 	struct inode *inode = mapping->host;
+-	struct compress_ctx cc = {
+-		.inode = inode,
+-		.log_cluster_size = F2FS_I(inode)->i_log_cluster_size,
+-		.cluster_size = F2FS_I(inode)->i_cluster_size,
+-		.cluster_idx = NULL_CLUSTER,
+-		.rpages = NULL,
+-		.nr_rpages = 0,
+-		.cpages = NULL,
+-		.rbuf = NULL,
+-		.cbuf = NULL,
+-		.rlen = PAGE_SIZE * F2FS_I(inode)->i_cluster_size,
+-		.private = NULL,
++	struct compress_ctx cc[2] = {
++		[0] = {
++			.inode = inode,
++			.log_cluster_size = F2FS_I(inode)->i_log_cluster_size,
++			.cluster_size = F2FS_I(inode)->i_cluster_size,
++			.cluster_idx = NULL_CLUSTER,
++			.rpages = NULL,
++			.nr_rpages = 0,
++			.cpages = NULL,
++			.rbuf = NULL,
++			.cbuf = NULL,
++			.rlen = PAGE_SIZE * F2FS_I(inode)->i_cluster_size,
++			.private = NULL,
++		},
++		[1] = {
++			.inode = inode,
++			.log_cluster_size = F2FS_I(inode)->i_log_cluster_size,
++			.cluster_size = F2FS_I(inode)->i_cluster_size,
++			.cluster_idx = NULL_CLUSTER,
++			.rpages = NULL,
++			.nr_rpages = 0,
++			.cpages = NULL,
++			.rbuf = NULL,
++			.cbuf = NULL,
++			.rlen = PAGE_SIZE * F2FS_I(inode)->i_cluster_size,
++			.private = NULL,
++		},
+ 	};
++	pgoff_t active_pair_idx = NULL_CLUSTER;
+ #endif
+ 	int nr_pages;
+ 	pgoff_t index;
+@@ -3041,6 +3111,10 @@ static int f2fs_write_cache_pages(struct address_space *mapping,
+ 		tag = PAGECACHE_TAG_DIRTY;
+ retry:
+ 	retry = 0;
++#ifdef CONFIG_F2FS_FS_COMPRESSION
++	if (f2fs_compressed_file(inode))
++		active_pair_idx = NULL_CLUSTER;
++#endif
+ 	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
+ 		tag_pages_for_writeback(mapping, index, end);
+ 	done_index = index;
+@@ -3053,20 +3127,53 @@ retry:
+ 		for (i = 0; i < nr_pages; i++) {
+ 			struct page *page = pvec.pages[i];
+ 			bool need_readd;
++#ifdef CONFIG_F2FS_FS_COMPRESSION
++			struct compress_ctx *cur_cc = NULL;
++#endif
+ readd:
+ 			need_readd = false;
+ #ifdef CONFIG_F2FS_FS_COMPRESSION
+ 			if (f2fs_compressed_file(inode)) {
+-				ret = f2fs_init_compress_ctx(&cc);
++				pgoff_t page_cluster_idx = page->index >>
++						F2FS_I(inode)->i_log_cluster_size;
++				pgoff_t page_pair_idx = page_cluster_idx >> 1;
++				unsigned int pair_slot = page_cluster_idx & 1;
++
++				/*
++				 * P0 keeps one fixed sibling pair active.  A page from the
++				 * next pair first drains the current pair with stock write
++				 * semantics, then re-enters the scan for this page.
++				 */
++				if (active_pair_idx != NULL_CLUSTER &&
++						active_pair_idx != page_pair_idx) {
++					ret = f2fs_flush_copack_pair(cc, &submitted,
++								wbc, io_type);
++					active_pair_idx = NULL_CLUSTER;
++					if (!ret)
++						need_readd = true;
++					goto result;
++				}
++
++				if (active_pair_idx == NULL_CLUSTER)
++					active_pair_idx = page_pair_idx;
++
++				cur_cc = &cc[pair_slot];
++
++				ret = f2fs_init_compress_ctx(cur_cc);
+ 				if (ret) {
+ 					done = 1;
+ 					break;
+ 				}
+ 
+-				if (!f2fs_cluster_can_merge_page(&cc,
++				/*
++				 * With fixed (2k, 2k+1) pairing this should not trigger,
++				 * but keep the old defensive flush/readd behavior.
++				 */
++				if (!f2fs_cluster_can_merge_page(cur_cc,
+ 								page->index)) {
+-					ret = f2fs_write_multi_pages(&cc,
+-						&submitted, wbc, io_type);
++					ret = f2fs_flush_copack_pair(cc, &submitted,
++								wbc, io_type);
++					active_pair_idx = NULL_CLUSTER;
+ 					if (!ret)
+ 						need_readd = true;
+ 					goto result;
+@@ -3075,7 +3182,7 @@ readd:
+ 				if (unlikely(f2fs_cp_error(sbi)))
+ 					goto lock_page;
+ 
+-				if (f2fs_cluster_is_empty(&cc)) {
++				if (f2fs_cluster_is_empty(cur_cc)) {
+ 					void *fsdata = NULL;
+ 					struct page *pagep;
+ 					int ret2;
+@@ -3136,8 +3243,9 @@ continue_unlock:
+ 
+ #ifdef CONFIG_F2FS_FS_COMPRESSION
+ 			if (f2fs_compressed_file(inode)) {
++				f2fs_bug_on(sbi, !cur_cc);
+ 				get_page(page);
+-				f2fs_compress_ctx_add_page(&cc, page);
++				f2fs_compress_ctx_add_page(cur_cc, page);
+ 				continue;
+ 			}
+ #endif
+@@ -3187,9 +3295,12 @@ next:
+ 		cond_resched();
+ 	}
+ #ifdef CONFIG_F2FS_FS_COMPRESSION
+-	/* flush remained pages in compress cluster */
+-	if (f2fs_compressed_file(inode) && !f2fs_cluster_is_empty(&cc)) {
+-		ret = f2fs_write_multi_pages(&cc, &submitted, wbc, io_type);
++	/* flush remained pages in the active fixed sibling pair */
++	if (f2fs_compressed_file(inode) &&
++			(!f2fs_cluster_is_empty(&cc[0]) ||
++			 !f2fs_cluster_is_empty(&cc[1]))) {
++		ret = f2fs_flush_copack_pair(cc, &submitted, wbc, io_type);
++		active_pair_idx = NULL_CLUSTER;
+ 		nwritten += submitted;
+ 		wbc->nr_to_write -= submitted;
+ 		if (ret) {
+@@ -3197,8 +3308,10 @@ next:
+ 			retry = 0;
+ 		}
+ 	}
+-	if (f2fs_compressed_file(inode))
+-		f2fs_destroy_compress_ctx(&cc, false);
++	if (f2fs_compressed_file(inode)) {
++		f2fs_destroy_compress_ctx(&cc[0], false);
++		f2fs_destroy_compress_ctx(&cc[1], false);
++	}
+ #endif
+ 	if (retry) {
+ 		index = 0;
+-- 
+2.47.3
+
