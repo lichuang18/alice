@@ -1435,11 +1435,16 @@ out:
  * the victim data block is ignored.
  */
 /*
- * P2 safety fence: until whole-pair relocation is implemented, do not move
- * any block belonging to a COPACK_ADDR cluster.  This preserves the implicit
- * adjacency invariant at the cost of making such blocks temporarily
- * unmovable by GC.  Fresh/low-utilization P2 experiments should run with
- * background_gc=off.
+ * CoPack clusters are fixed adjacent pairs.  The hidden shared block has no
+ * node address slot, so every GC relocation must preserve the whole physical
+ * run:
+ *
+ *     even-private | hidden-shared | odd-private
+ *
+ * Moving any constituent block independently would break the +1/-1 implicit
+ * address invariant used by the read path.  P4 therefore treats the pair as
+ * the minimum GC relocation unit and copies the already-compressed bytes
+ * verbatim; no decompression/recompression is involved.
  */
 static bool gc_block_belongs_to_copack(struct inode *inode, pgoff_t bidx)
 {
@@ -1453,6 +1458,321 @@ static bool gc_block_belongs_to_copack(struct inode *inode, pgoff_t bidx)
 	ret = dn.data_blkaddr == COPACK_ADDR;
 	f2fs_put_dnode(&dn);
 	return ret;
+}
+
+static int f2fs_gc_read_copack_block(struct inode *inode,
+		struct page *type_page, block_t blkaddr, void *dst)
+{
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	struct f2fs_io_info fio = {
+		.sbi = sbi,
+		.ino = inode->i_ino,
+		.type = DATA,
+		.temp = COLD,
+		.op = REQ_OP_READ,
+		.op_flags = 0,
+		.old_blkaddr = blkaddr,
+		.new_blkaddr = blkaddr,
+		.page = type_page,
+		.encrypted_page = NULL,
+		.in_list = 0,
+		.retry = 0,
+		.io_type = FS_GC_DATA_IO,
+	};
+	struct page *mpage;
+	int err;
+
+	f2fs_wait_on_block_writeback(inode, blkaddr);
+
+	mpage = f2fs_grab_cache_page(META_MAPPING(sbi), blkaddr, false);
+	if (!mpage)
+		return -ENOMEM;
+
+	if (!PageUptodate(mpage)) {
+		fio.encrypted_page = mpage;
+		err = f2fs_submit_page_bio(&fio);
+		if (err) {
+			f2fs_put_page(mpage, 1);
+			return err;
+		}
+
+		f2fs_update_iostat(sbi, FS_DATA_READ_IO, F2FS_BLKSIZE);
+		f2fs_update_iostat(sbi, FS_GDATA_READ_IO, F2FS_BLKSIZE);
+
+		/*
+		 * submit_page_bio unlocks the page on I/O completion. Keep our
+		 * page reference while waiting and re-lock it exactly like the
+		 * stock move_data_block() path.
+		 */
+		lock_page(mpage);
+		if (unlikely(mpage->mapping != META_MAPPING(sbi) ||
+					!PageUptodate(mpage))) {
+			f2fs_put_page(mpage, 1);
+			return -EIO;
+		}
+	}
+
+	memcpy(dst, page_address(mpage), PAGE_SIZE);
+	f2fs_put_page(mpage, 1);
+	return 0;
+}
+
+/*
+ * Return value:
+ *   > 0 : number of physical blocks relocated
+ *     0 : this victim block belongs to the pair but is not the canonical
+ *         first block; another entry in the same old run owns the relocation
+ *   < 0 : relocation was not performed
+ */
+static int move_copack_pair(struct inode *inode, pgoff_t bidx,
+		int gc_type, unsigned int victim_segno, int victim_off)
+{
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	struct f2fs_inode_info *fi = F2FS_I(inode);
+	struct dnode_of_data dn;
+	struct node_info ni;
+	struct f2fs_summary *sums = NULL;
+	struct page *type_page = NULL;
+	struct f2fs_io_info fio = {
+		.sbi = sbi,
+		.ino = inode->i_ino,
+		.type = DATA,
+		.temp = COLD,
+		.op = REQ_OP_WRITE,
+		.op_flags = REQ_SYNC,
+		.old_blkaddr = NULL_ADDR,
+		.new_blkaddr = NULL_ADDR,
+		.encrypted_page = NULL,
+		.compressed_page = NULL,
+		.need_lock = LOCK_REQ,
+		.io_type = FS_GC_DATA_IO,
+	};
+	block_t *old_blks = NULL, *new_blks = NULL;
+	void *raw = NULL;
+	pgoff_t cluster_start, even_start;
+	unsigned int cluster_size = fi->i_cluster_size;
+	unsigned int cluster_idx;
+	unsigned int even_ofs, odd_ofs;
+	unsigned int even_private = 0, odd_private = 0;
+	unsigned int run_blocks, pos, i;
+	block_t hidden, victim_blkaddr;
+	int err = 0;
+	bool op_locked = false;
+	bool io_order_locked = false;
+
+	if (!f2fs_lfs_mode(sbi) || F2FS_IO_ALIGNED(sbi))
+		return -EAGAIN;
+	if (!f2fs_compressed_file(inode) || IS_ENCRYPTED(inode))
+		return -EAGAIN;
+
+	cluster_start = round_down(bidx, cluster_size);
+	cluster_idx = cluster_start >> fi->i_log_cluster_size;
+	even_start = cluster_start - ((cluster_idx & 1) ? cluster_size : 0);
+	victim_blkaddr = START_BLOCK(sbi, victim_segno) + victim_off;
+
+	/* Serialize against node-address publication by normal writers. */
+	if (!f2fs_trylock_op(sbi))
+		return -EAGAIN;
+	op_locked = true;
+
+	set_new_dnode(&dn, inode, NULL, NULL, 0);
+	err = f2fs_get_dnode_of_data(&dn, even_start, LOOKUP_NODE);
+	if (err)
+		goto out;
+
+	even_ofs = dn.ofs_in_node;
+	odd_ofs = even_ofs + cluster_size;
+	if (odd_ofs + cluster_size > ADDRS_PER_PAGE(dn.node_page, inode)) {
+		err = -EAGAIN;
+		goto out_put_dnode;
+	}
+	if (data_blkaddr(inode, dn.node_page, even_ofs) != COPACK_ADDR ||
+			data_blkaddr(inode, dn.node_page, odd_ofs) != COPACK_ADDR) {
+		err = -EAGAIN;
+		goto out_put_dnode;
+	}
+
+	for (i = 1; i < cluster_size; i++) {
+		block_t addr = data_blkaddr(inode, dn.node_page, even_ofs + i);
+
+		if (!__is_valid_data_blkaddr(addr))
+			break;
+		even_private++;
+	}
+	for (i = 1; i < cluster_size; i++) {
+		block_t addr = data_blkaddr(inode, dn.node_page, odd_ofs + i);
+
+		if (!__is_valid_data_blkaddr(addr))
+			break;
+		odd_private++;
+	}
+	if (!even_private || !odd_private) {
+		err = -EFSCORRUPTED;
+		goto out_put_dnode;
+	}
+
+	run_blocks = even_private + 1 + odd_private;
+	old_blks = kcalloc(run_blocks, sizeof(*old_blks), GFP_NOFS);
+	new_blks = kcalloc(run_blocks, sizeof(*new_blks), GFP_NOFS);
+	sums = kcalloc(run_blocks, sizeof(*sums), GFP_NOFS);
+	raw = f2fs_kvmalloc(sbi, array_size(run_blocks, PAGE_SIZE), GFP_NOFS);
+	if (!old_blks || !new_blks || !sums || !raw) {
+		err = -ENOMEM;
+		goto out_put_dnode;
+	}
+
+	err = f2fs_get_node_info(sbi, dn.nid, &ni, false);
+	if (err)
+		goto out_put_dnode;
+	fio.version = ni.version;
+
+	pos = 0;
+	for (i = 0; i < even_private; i++, pos++) {
+		old_blks[pos] = data_blkaddr(inode, dn.node_page,
+					even_ofs + i + 1);
+		set_summary(&sums[pos], dn.nid, even_ofs + i + 1, ni.version);
+	}
+	hidden = old_blks[pos - 1] + 1;
+	old_blks[pos] = hidden;
+	set_summary(&sums[pos], dn.nid, even_ofs, ni.version);
+	pos++;
+	for (i = 0; i < odd_private; i++, pos++) {
+		old_blks[pos] = data_blkaddr(inode, dn.node_page,
+					odd_ofs + i + 1);
+		set_summary(&sums[pos], dn.nid, odd_ofs + i + 1, ni.version);
+	}
+	f2fs_bug_on(sbi, pos != run_blocks);
+
+	/* Validate the P2/P3 physical representation before touching the SIT. */
+	for (i = 1; i < run_blocks; i++) {
+		if (old_blks[i] != old_blks[i - 1] + 1) {
+			err = -EFSCORRUPTED;
+			goto out_put_dnode;
+		}
+	}
+	if (old_blks[even_private + 1] != hidden + 1) {
+		err = -EFSCORRUPTED;
+		goto out_put_dnode;
+	}
+
+	/* P2 allocator never crosses a segment; retain that invariant in GC. */
+	for (i = 0; i < run_blocks; i++) {
+		unsigned int segno = GET_SEGNO(sbi, old_blks[i]);
+		unsigned int off = GET_BLKOFF_FROM_SEG0(sbi, old_blks[i]);
+
+		if (segno != victim_segno || !check_valid_map(sbi, segno, off)) {
+			err = -EAGAIN;
+			goto out_put_dnode;
+		}
+	}
+
+	/* Only the first physical block owns the whole-pair move. */
+	if (victim_blkaddr != old_blks[0]) {
+		err = 0;
+		goto out_put_dnode;
+	}
+
+	type_page = f2fs_grab_cache_page(inode->i_mapping, even_start, false);
+	if (!type_page) {
+		err = -ENOMEM;
+		goto out_put_dnode;
+	}
+	fio.page = type_page;
+
+	/* Snapshot the compressed bytes before the allocator invalidates old SIT bits. */
+	for (i = 0; i < run_blocks; i++) {
+		err = f2fs_gc_read_copack_block(inode, type_page, old_blks[i],
+					(char *)raw + i * PAGE_SIZE);
+		if (err)
+			goto out_put_type_page;
+	}
+
+	/* Match the ordering discipline used by direct GC block relocation. */
+	down_write(&sbi->io_order_lock);
+	io_order_locked = true;
+
+	err = f2fs_allocate_copack_run(&fio, old_blks, sums,
+				run_blocks, new_blks);
+	if (err)
+		goto out_unlock_io_order;
+
+	/*
+	 * From here on, allocation has committed the SIT/SSA transition.  Target
+	 * meta pages are obtained with f2fs_grab_meta_page(), which retries until
+	 * it succeeds, so there is no allocation-failure rollback window here.
+	 */
+	for (i = 0; i < run_blocks; i++) {
+		struct page *tpage;
+
+		invalidate_mapping_pages(META_MAPPING(sbi),
+				old_blks[i], old_blks[i]);
+		f2fs_invalidate_compress_page(sbi, old_blks[i]);
+
+		tpage = f2fs_grab_meta_page(sbi, new_blks[i]);
+		memcpy(page_address(tpage), (char *)raw + i * PAGE_SIZE, PAGE_SIZE);
+		set_page_dirty(tpage);
+		if (clear_page_dirty_for_io(tpage))
+			dec_page_count(sbi, F2FS_DIRTY_META);
+		set_page_writeback(tpage);
+		ClearPageError(type_page);
+
+		fio.op = REQ_OP_WRITE;
+		fio.op_flags = REQ_SYNC;
+		fio.encrypted_page = tpage;
+		fio.compressed_page = NULL;
+		fio.old_blkaddr = old_blks[i];
+		fio.new_blkaddr = new_blks[i];
+		fio.retry = 0;
+		f2fs_submit_page_write(&fio);
+		f2fs_bug_on(sbi, fio.retry);
+		f2fs_update_device_state(sbi, inode->i_ino, new_blks[i], 1);
+		f2fs_update_iostat(sbi, FS_GC_DATA_IO, F2FS_BLKSIZE);
+		f2fs_put_page(tpage, 1);
+	}
+	fio.encrypted_page = NULL;
+
+	/* Publish only the private addresses; the hidden block stays implicit. */
+	for (i = 0; i < even_private; i++) {
+		dn.ofs_in_node = even_ofs + i + 1;
+		dn.data_blkaddr = new_blks[i];
+		f2fs_set_data_blkaddr(&dn);
+	}
+	for (i = 0; i < odd_private; i++) {
+		dn.ofs_in_node = odd_ofs + i + 1;
+		dn.data_blkaddr = new_blks[even_private + 1 + i];
+		f2fs_set_data_blkaddr(&dn);
+	}
+
+	dn.ofs_in_node = even_ofs;
+	f2fs_update_extent_cache_range(&dn, even_start, NULL_ADDR,
+				cluster_size * 2);
+	set_inode_flag(inode, FI_APPEND_WRITE);
+
+	pr_info_ratelimited("COPACK_P4_GC ino=%lu pair=%lu run=%u "
+			"old=%u..%u new=%u..%u shared=%u anchor=(%u,%u)\n",
+		inode->i_ino, even_start >> (fi->i_log_cluster_size + 1),
+		run_blocks, old_blks[0], old_blks[run_blocks - 1],
+		new_blks[0], new_blks[run_blocks - 1],
+		new_blks[even_private], dn.nid, even_ofs);
+
+	err = run_blocks;
+
+out_unlock_io_order:
+	if (io_order_locked)
+		up_write(&sbi->io_order_lock);
+out_put_type_page:
+	if (type_page)
+		f2fs_put_page(type_page, 1);
+out_put_dnode:
+	f2fs_put_dnode(&dn);
+out:
+	if (op_locked)
+		f2fs_unlock_op(sbi);
+	kvfree(raw);
+	kfree(sums);
+	kfree(new_blks);
+	kfree(old_blks);
+	return err;
 }
 
 static int gc_data_segment(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
@@ -1543,8 +1863,9 @@ next_step:
 								ofs_in_node;
 
 			if (gc_block_belongs_to_copack(inode, start_bidx)) {
+				/* P4 moves the already-compressed physical pair in phase 4. */
 				up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
-				iput(inode);
+				add_gc_inode(gc_list, inode);
 				continue;
 			}
 
@@ -1578,6 +1899,7 @@ next_step:
 		if (inode) {
 			struct f2fs_inode_info *fi = F2FS_I(inode);
 			bool locked = false;
+			bool is_copack;
 			int err;
 
 			if (S_ISREG(inode->i_mode)) {
@@ -1599,14 +1921,25 @@ next_step:
 
 			start_bidx = f2fs_start_bidx_of_node(nofs, inode)
 								+ ofs_in_node;
-			if (f2fs_post_read_required(inode))
+			is_copack = gc_block_belongs_to_copack(inode, start_bidx);
+			if (is_copack) {
+				int moved = move_copack_pair(inode, start_bidx,
+							gc_type, segno, off);
+
+				if (moved > 0) {
+					submitted += moved;
+					stat_inc_data_blk_count(sbi, moved, gc_type);
+				}
+				err = moved < 0 ? moved : 0;
+			} else if (f2fs_post_read_required(inode)) {
 				err = move_data_block(inode, start_bidx,
 							gc_type, segno, off);
-			else
+			} else {
 				err = move_data_page(inode, start_bidx, gc_type,
 								segno, off);
+			}
 
-			if (!err && (gc_type == FG_GC ||
+			if (!is_copack && !err && (gc_type == FG_GC ||
 					f2fs_post_read_required(inode)))
 				submitted++;
 
@@ -1615,7 +1948,8 @@ next_step:
 				up_write(&fi->i_gc_rwsem[READ]);
 			}
 
-			stat_inc_data_blk_count(sbi, 1, gc_type);
+			if (!is_copack)
+				stat_inc_data_blk_count(sbi, 1, gc_type);
 		}
 	}
 

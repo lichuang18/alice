@@ -1,0 +1,16 @@
+--- a/gc.c
++++ b/gc.c
+@@ -1499,8 +1499,11 @@
+ 		f2fs_update_iostat(sbi, FS_DATA_READ_IO, F2FS_BLKSIZE);
+ 		f2fs_update_iostat(sbi, FS_GDATA_READ_IO, F2FS_BLKSIZE);
+ 
+-		/* submit_page_bio unlocks the page on I/O completion. */
+-		f2fs_put_page(mpage, 0);
++		/*
++		 * submit_page_bio unlocks the page on I/O completion. Keep our
++		 * page reference while waiting and re-lock it exactly like the
++		 * stock move_data_block() path.
++		 */
+ 		lock_page(mpage);
+ 		if (unlikely(mpage->mapping != META_MAPPING(sbi) ||
+ 					!PageUptodate(mpage))) {

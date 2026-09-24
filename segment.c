@@ -3454,10 +3454,12 @@ static int __get_segment_type(struct f2fs_io_info *fio)
  * the current LFS curseg.  We do not search SSR holes or cross a segment
  * boundary, because Co-Pack derives the hidden block address from adjacency.
  *
- * old_blkaddrs[] correspond one-to-one with the new blocks except for the
- * hidden Co-Pack block, whose old address is NULL_ADDR.  sums[] contains the
- * SSA entry for every new block; in particular the hidden Co-Pack block uses
- * the even cluster's COPACK_ADDR slot as its reverse-mapping anchor.
+ * old_blkaddrs[] correspond one-to-one with the new blocks.  On the normal
+ * CoPack write path the hidden block has no predecessor and therefore uses
+ * NULL_ADDR; on whole-pair GC it carries the old hidden blkaddr.  sums[]
+ * contains the SSA entry for every new block; in particular the hidden
+ * Co-Pack block uses the even cluster's COPACK_ADDR slot as its reverse-map
+ * anchor.
  */
 int f2fs_allocate_copack_run(struct f2fs_io_info *fio,
 		block_t *old_blkaddrs, struct f2fs_summary *sums,
@@ -3470,6 +3472,7 @@ int f2fs_allocate_copack_run(struct f2fs_io_info *fio,
 	int type;
 	unsigned int i;
 	int ret = 0;
+	bool from_gc = fio->io_type == FS_GC_DATA_IO;
 
 	if (!nr_blocks || !f2fs_lfs_mode(sbi) || F2FS_IO_ALIGNED(sbi))
 		return -EAGAIN;
@@ -3507,14 +3510,19 @@ int f2fs_allocate_copack_run(struct f2fs_io_info *fio,
 		stat_inc_block_count(sbi, curseg);
 
 		if (GET_SEGNO(sbi, old) != NULL_SEGNO) {
-			update_segment_mtime(sbi, old, 0);
+			unsigned long long old_mtime = from_gc ?
+					get_segment_mtime(sbi, old) : 0;
+
+			if (!from_gc)
+				update_segment_mtime(sbi, old, 0);
 			update_sit_entry(sbi, old, -1);
 			locate_dirty_segment(sbi, GET_SEGNO(sbi, old));
-			if (old != NULL_ADDR)
+			if (!from_gc && old != NULL_ADDR)
 				atomic64_inc(&sbi->mot2.update_path_invalid_blks_total);
+			update_segment_mtime(sbi, new, old_mtime);
+		} else {
+			update_segment_mtime(sbi, new, 0);
 		}
-
-		update_segment_mtime(sbi, new, 0);
 		update_sit_entry(sbi, new, 1);
 		locate_dirty_segment(sbi, GET_SEGNO(sbi, new));
 		new_blkaddrs[i] = new;
