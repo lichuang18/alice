@@ -2435,6 +2435,250 @@ out:
 }
 #endif
 
+#ifdef CONFIG_F2FS_FS_COMPRESSION
+/*
+ * Try one physical-read operation for a readahead window that covers both
+ * halves of a CoPack pair.  -EAGAIN means no page/context was consumed;
+ * callers should use the original per-cluster path without modification.
+ * Other errors are terminal and this function has unlocked all rpages.
+ *
+ * CoPack P2 allocates the pair as:
+ *   even private | hidden shared | odd private
+ * Using the same locked node page to validate the entire run prevents
+ * accidentally combining unrelated blocks after rewriting or GC relocation.
+ */
+static int f2fs_read_copack_pair_pages(struct compress_ctx *even,
+		struct compress_ctx *odd, struct bio **bio_ret)
+{
+	struct inode *inode = even->inode;
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	struct dnode_of_data dn;
+	struct decompress_io_ctx *ed = NULL, *od = NULL;
+	struct bio *pair_bio = NULL;
+	struct bio_post_read_ctx *ctx;
+	block_t first = NULL_ADDR, blk, shared;
+	unsigned int eof_pages, even_ofs, odd_ofs;
+	unsigned int ne = 0, no = 0, count, i, added = 0;
+	int ret = -EAGAIN;
+
+	if ((even->cluster_idx & 1) || odd->cluster_idx != even->cluster_idx + 1 ||
+			!even->nr_rpages || !odd->nr_rpages ||
+			even->cluster_size != odd->cluster_size ||
+			fscrypt_inode_uses_fs_layer_crypto(inode) ||
+			fscrypt_inode_uses_inline_crypto(inode))
+		return -EAGAIN;
+
+	/* EOF/truncation: preserve the usual per-cluster zero-fill path. */
+	eof_pages = DIV_ROUND_UP(f2fs_readpage_limit(inode), PAGE_SIZE);
+	if (((odd->cluster_idx + 1) << odd->log_cluster_size) > eof_pages)
+		return -EAGAIN;
+	for (i = 0; i < even->cluster_size; i++) {
+		if (even->rpages[i] &&
+			(even->rpages[i]->index >= eof_pages ||
+			 PageUptodate(even->rpages[i])))
+			return -EAGAIN;
+		if (odd->rpages[i] &&
+			(odd->rpages[i]->index >= eof_pages ||
+			 PageUptodate(odd->rpages[i])))
+			return -EAGAIN;
+	}
+
+	set_new_dnode(&dn, inode, NULL, NULL, 0);
+	if (f2fs_get_dnode_of_data(&dn,
+			even->cluster_idx << even->log_cluster_size, LOOKUP_NODE))
+		return -EAGAIN;
+
+	even_ofs = dn.ofs_in_node;
+	odd_ofs = even_ofs + even->cluster_size;
+	if (odd_ofs + odd->cluster_size >
+			ADDRS_PER_PAGE(dn.node_page, inode) ||
+			data_blkaddr(inode, dn.node_page, even_ofs) != COPACK_ADDR ||
+			data_blkaddr(inode, dn.node_page, odd_ofs) != COPACK_ADDR)
+		goto put_dnode;
+
+	for (i = 1; i < even->cluster_size; i++) {
+		blk = data_blkaddr(inode, dn.node_page, even_ofs + i);
+		if (!__is_valid_data_blkaddr(blk))
+			break;
+		if (!f2fs_is_valid_blkaddr(sbi, blk, DATA_GENERIC_ENHANCE_READ))
+			goto put_dnode;
+		if (!ne)
+			first = blk;
+		if (blk != first + ne)
+			goto put_dnode;
+		ne++;
+	}
+	if (!ne)
+		goto put_dnode;
+	for (; i < even->cluster_size; i++) {
+		blk = data_blkaddr(inode, dn.node_page, even_ofs + i);
+		if (__is_valid_data_blkaddr(blk) || f2fs_is_compress_marker(blk))
+			goto put_dnode;
+	}
+
+	shared = first + ne;
+	if (!f2fs_is_valid_blkaddr(sbi, shared, DATA_GENERIC_ENHANCE_READ))
+		goto put_dnode;
+	for (i = 1; i < odd->cluster_size; i++) {
+		blk = data_blkaddr(inode, dn.node_page, odd_ofs + i);
+		if (!__is_valid_data_blkaddr(blk))
+			break;
+		if (!f2fs_is_valid_blkaddr(sbi, blk, DATA_GENERIC_ENHANCE_READ) ||
+				blk != shared + 1 + no)
+			goto put_dnode;
+		no++;
+	}
+	if (!no)
+		goto put_dnode;
+	for (; i < odd->cluster_size; i++) {
+		blk = data_blkaddr(inode, dn.node_page, odd_ofs + i);
+		if (__is_valid_data_blkaddr(blk) || f2fs_is_compress_marker(blk))
+			goto put_dnode;
+	}
+
+	count = ne + 1 + no;
+	if (count > bio_max_segs(count) ||
+			(sbi->max_io_bytes && count * PAGE_SIZE > sbi->max_io_bytes))
+		goto put_dnode;
+	for (i = 1; i < count; i++) {
+		if (f2fs_target_device(sbi, first + i, NULL) !=
+				f2fs_target_device(sbi, first, NULL))
+			goto put_dnode;
+	}
+
+	/* Keep the node mapping locked until the pair BIO is submitted. */
+	even->copack = true;
+	even->copack_odd = false;
+	even->copack_private_cpages = ne;
+	even->copack_blkaddr = shared;
+	even->nr_cpages = ne + 1;
+	odd->copack = true;
+	odd->copack_odd = true;
+	odd->copack_private_cpages = no;
+	odd->copack_blkaddr = shared;
+	odd->nr_cpages = no + 1;
+
+	ed = f2fs_alloc_dic(even);
+	if (IS_ERR(ed)) {
+		ret = PTR_ERR(ed);
+		ed = NULL;
+		goto fail;
+	}
+	od = f2fs_alloc_dic(odd);
+	if (IS_ERR(od)) {
+		ret = PTR_ERR(od);
+		od = NULL;
+		goto fail;
+	}
+
+	/* A dedicated BIO keeps failure/ownership handling local to this pair. */
+	pair_bio = f2fs_grab_read_bio(inode, first, count, REQ_RAHEAD,
+				ed->cpages[0]->index, false);
+	if (IS_ERR(pair_bio)) {
+		ret = PTR_ERR(pair_bio);
+		pair_bio = NULL;
+		goto fail;
+	}
+	for (i = 0; i < count; i++) {
+		struct decompress_io_ctx *dic = i <= ne ? ed : od;
+		struct page *cpage = i < ne ? ed->cpages[i] :
+				i == ne ? ed->cpages[ne] : od->cpages[i - ne - 1];
+
+		blk = first + i;
+		f2fs_wait_on_block_writeback(inode, blk);
+		if (bio_add_page(pair_bio, cpage, PAGE_SIZE, 0) != PAGE_SIZE) {
+			ret = -EIO;
+			goto fail;
+		}
+		refcount_inc(&dic->refcnt);
+		added++;
+	}
+
+	/* All allocation and BIO-add failure points are now behind us. */
+	ed->copack_partner_dic = od;
+	ctx = get_post_read_ctx(pair_bio);
+	ctx->enabled_steps |= STEP_DECOMPRESS;
+	for (i = 0; i < count; i++) {
+		inc_page_count(sbi, F2FS_RD_DATA);
+		f2fs_update_iostat(sbi, FS_DATA_READ_IO, F2FS_BLKSIZE);
+		f2fs_update_iostat(sbi, FS_CDATA_READ_IO, F2FS_BLKSIZE);
+	}
+
+	/* Flush any earlier normal reads before submitting the ordered pair. */
+	if (*bio_ret) {
+		__submit_bio(sbi, *bio_ret, DATA);
+		*bio_ret = NULL;
+	}
+	__submit_bio(sbi, pair_bio, DATA);
+	f2fs_put_dnode(&dn);
+	return 0;
+
+put_dnode:
+	f2fs_put_dnode(&dn);
+	return -EAGAIN;
+fail:
+	f2fs_put_dnode(&dn);
+	/* No pair BIO has been submitted. Drop per-page BIO references first. */
+	if (pair_bio) {
+		/* Release precisely the references acquired by bio_add_page. */
+		for (i = 0; i < added; i++) {
+			struct page *cpage = i < ne ? ed->cpages[i] :
+				i == ne ? ed->cpages[ne] :
+					od->cpages[i - ne - 1];
+
+			f2fs_put_page_dic(cpage);
+		}
+		if (pair_bio->bi_private)
+			mempool_free(pair_bio->bi_private, bio_post_read_ctx_pool);
+		bio_put(pair_bio);
+	}
+	if (ed)
+		f2fs_decompress_end_io(ed, true);
+	else {
+		for (i = 0; i < even->cluster_size; i++)
+			if (even->rpages[i])
+				unlock_page(even->rpages[i]);
+	}
+	if (od)
+		f2fs_decompress_end_io(od, true);
+	else {
+		for (i = 0; i < odd->cluster_size; i++)
+			if (odd->rpages[i])
+				unlock_page(odd->rpages[i]);
+	}
+	return ret;
+}
+
+/*
+ * Delay an even cluster until the immediately following odd cluster is in
+ * the same readahead window.  Invalid/nonadjacent/relocated pairs use the
+ * original reader, preserving independent cluster semantics.
+ */
+static int f2fs_flush_read_pair(struct compress_ctx *held,
+		struct compress_ctx *next_cc, struct bio **bio,
+		unsigned nr_pages, sector_t *last, bool readahead)
+{
+	int ret = -EAGAIN, second = 0;
+
+	if (held->rpages && next_cc->rpages && readahead)
+		ret = f2fs_read_copack_pair_pages(held, next_cc, bio);
+	if (ret == -EAGAIN) {
+		ret = 0;
+		if (held->rpages)
+			ret = f2fs_read_multi_pages(held, bio, nr_pages,
+					last, readahead, false);
+		if (next_cc->rpages)
+			second = f2fs_read_multi_pages(next_cc, bio, nr_pages,
+					last, readahead, false);
+		if (!ret)
+			ret = second;
+	}
+	f2fs_destroy_compress_ctx(held, false);
+	f2fs_destroy_compress_ctx(next_cc, false);
+	return ret;
+}
+#endif
+
 /*
  * This function was originally taken from fs/mpage.c, and customized for f2fs.
  * Major change was from block_size == page_size in f2fs by default.
@@ -2455,6 +2699,12 @@ static int f2fs_mpage_readpages(struct inode *inode,
 		.cpages = NULL,
 		.nr_rpages = 0,
 		.nr_cpages = 0,
+	};
+	struct compress_ctx held = {
+		.inode = inode,
+		.log_cluster_size = F2FS_I(inode)->i_log_cluster_size,
+		.cluster_size = F2FS_I(inode)->i_cluster_size,
+		.cluster_idx = NULL_CLUSTER,
 	};
 	pgoff_t nc_cluster_idx = NULL_CLUSTER;
 #endif
@@ -2481,11 +2731,31 @@ static int f2fs_mpage_readpages(struct inode *inode,
 		if (f2fs_compressed_file(inode)) {
 			/* there are remained compressed pages, submit them */
 			if (!f2fs_cluster_can_merge_page(&cc, page->index)) {
-				ret = f2fs_read_multi_pages(&cc, &bio,
+				if (held.rpages) {
+					ret = f2fs_flush_read_pair(&held, &cc,
+							&bio, max_nr_pages,
+							&last_block_in_bio, rac != NULL);
+				} else if (rac && !(cc.cluster_idx & 1) &&
+					(page->index >> cc.log_cluster_size) ==
+						cc.cluster_idx + 1) {
+					/* Wait for the immediately adjacent odd cluster. */
+					held = cc;
+					cc.rpages = NULL;
+					cc.nr_rpages = 0;
+					cc.nr_cpages = 0;
+					cc.cluster_idx = NULL_CLUSTER;
+					cc.copack = false;
+					cc.copack_odd = false;
+					cc.copack_private_cpages = 0;
+					cc.copack_blkaddr = NULL_ADDR;
+					ret = 0;
+				} else {
+					ret = f2fs_read_multi_pages(&cc, &bio,
 							max_nr_pages,
 							&last_block_in_bio,
 							rac != NULL, false);
-				f2fs_destroy_compress_ctx(&cc, false);
+					f2fs_destroy_compress_ctx(&cc, false);
+				}
 				if (ret)
 					goto set_error_page;
 			}
@@ -2499,6 +2769,15 @@ static int f2fs_mpage_readpages(struct inode *inode,
 				if (ret < 0)
 					goto set_error_page;
 				else if (!ret) {
+					if (held.rpages) {
+						ret = f2fs_read_multi_pages(&held, &bio,
+								max_nr_pages,
+								&last_block_in_bio,
+								rac != NULL, false);
+						f2fs_destroy_compress_ctx(&held, false);
+						if (ret)
+							goto set_error_page;
+					}
 					nc_cluster_idx =
 						page->index >> cc.log_cluster_size;
 					goto read_single_page;
@@ -2536,12 +2815,11 @@ next_page:
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 		if (f2fs_compressed_file(inode)) {
 			/* last page */
-			if (nr_pages == 1 && !f2fs_cluster_is_empty(&cc)) {
-				ret = f2fs_read_multi_pages(&cc, &bio,
-							max_nr_pages,
-							&last_block_in_bio,
-							rac != NULL, false);
-				f2fs_destroy_compress_ctx(&cc, false);
+			if (nr_pages == 1 &&
+					(held.rpages || !f2fs_cluster_is_empty(&cc))) {
+				ret = f2fs_flush_read_pair(&held, &cc, &bio,
+						max_nr_pages, &last_block_in_bio,
+						rac != NULL);
 			}
 		}
 #endif

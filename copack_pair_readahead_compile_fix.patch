@@ -1,0 +1,36 @@
+diff --git a/data.c b/data.c
+--- a/data.c
++++ b/data.c
+@@ -2655,26 +2655,26 @@
+  * original reader, preserving independent cluster semantics.
+  */
+ static int f2fs_flush_read_pair(struct compress_ctx *held,
+-		struct compress_ctx *current, struct bio **bio,
++		struct compress_ctx *next_cc, struct bio **bio,
+ 		unsigned nr_pages, sector_t *last, bool readahead)
+ {
+ 	int ret = -EAGAIN, second = 0;
+ 
+-	if (held->rpages && current->rpages && readahead)
+-		ret = f2fs_read_copack_pair_pages(held, current, bio);
++	if (held->rpages && next_cc->rpages && readahead)
++		ret = f2fs_read_copack_pair_pages(held, next_cc, bio);
+ 	if (ret == -EAGAIN) {
+ 		ret = 0;
+ 		if (held->rpages)
+ 			ret = f2fs_read_multi_pages(held, bio, nr_pages,
+ 					last, readahead, false);
+-		if (current->rpages)
+-			second = f2fs_read_multi_pages(current, bio, nr_pages,
++		if (next_cc->rpages)
++			second = f2fs_read_multi_pages(next_cc, bio, nr_pages,
+ 					last, readahead, false);
+ 		if (!ret)
+ 			ret = second;
+ 	}
+ 	f2fs_destroy_compress_ctx(held, false);
+-	f2fs_destroy_compress_ctx(current, false);
++	f2fs_destroy_compress_ctx(next_cc, false);
+ 	return ret;
+ }
+ #endif

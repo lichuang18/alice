@@ -1573,6 +1573,8 @@ struct decompress_io_ctx {
 	bool copack_odd;
 	unsigned int copack_private_cpages;
 	block_t copack_blkaddr;
+	/* Readahead-only: the even shared-page completion supplies the odd tail. */
+	struct decompress_io_ctx *copack_partner_dic;
 
 	void *private;			/* payload buffer for specified decompression algorithm */
 	void *private2;			/* extra payload buffer */
@@ -4090,6 +4092,7 @@ bool f2fs_is_compress_backend_ready(struct inode *inode);
 int f2fs_init_compress_mempool(void);
 void f2fs_destroy_compress_mempool(void);
 void f2fs_decompress_cluster(struct decompress_io_ctx *dic);
+void f2fs_copack_complete_partner(struct decompress_io_ctx *dic, bool failed);
 void f2fs_end_read_compressed_page(struct page *page, bool failed,
 							block_t blkaddr);
 bool f2fs_cluster_is_empty(struct compress_ctx *cc);

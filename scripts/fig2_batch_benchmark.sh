@@ -123,8 +123,17 @@ fi
 
 # Confirm the entire destructive batch exactly once before the first mkfs.
 echo "WARNING: ALL DATA on $DEV will be ERASED ($FORMATS formatting operations)."
-read -r -p 'Continue the entire batch? [y/Y]: ' CONFIRM
-[[ "$CONFIRM" == y || "$CONFIRM" == Y ]] || exit 0
+
+if [[ "${AUTO_CONFIRM:-0}" == "1" ]]; then
+    [[ "$DEV" == "/dev/nvme1n1" ]] || {
+        echo "[ERROR] Unexpected device: $DEV" >&2
+        exit 1
+    }
+    echo "[AUTO] Confirmed dedicated test device: $DEV"
+else
+    read -r -p 'Continue the entire batch? [y/Y]: ' CONFIRM
+    [[ "$CONFIRM" == y || "$CONFIRM" == Y ]] || exit 0
+fi
 
 mkdir -p "$RESULT_ROOT" "$MNT"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)_$$"
@@ -256,7 +265,7 @@ mount_fresh() {
     mount -t "$fstype" \
         -o "mode=lfs,background_gc=off,nodiscard,compress_algorithm=$algo,compress_log_size=2,compress_mode=fs,compress_extension=*,compress_cache" \
         "$DEV" "$MNT"
-        
+
     MOUNTED=1
     local actual
     actual="$(findmnt -n -o FSTYPE --target "$MNT")"
@@ -322,6 +331,16 @@ for t in "${WORKER_LIST[@]}"; do
                 # never use the write-warmed page cache as a read benchmark.
                 run_mode "$system" "$d" "$algo" "$t" seqread "$target" "$prefix"
                 run_mode "$system" "$d" "$algo" "$t" randread "$target" "$prefix"
+                # Verify data correctness before unmounting.
+                if [[ "$d" == enwik9 ]]; then
+                    echo "[VERIFY] Checking enwik9 integrity..."
+                    cmp "$STAGE/enwik9" "$target/enwik9" || {
+                        echo "[ERROR] Data corruption detected!" >&2
+                        exit 1
+                    }
+                    echo "[VERIFY] enwik9 PASS"
+                fi
+                
                 sync -f "$MNT"
                 if [[ "$REFORMAT_EACH_DATASET" == 1 ]]; then
                     unmount_clean

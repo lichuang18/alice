@@ -890,6 +890,39 @@ out_end_io:
 }
 
 /*
+ * Pair readahead submits the shared physical block only once, into even's
+ * terminal cpage.  Copy its untouched contents to odd's distinct terminal
+ * cpage BEFORE either decompressor may rewrite the tail in place.
+ *
+ * Odd cannot finish early: its remaining_pages includes this synthetic
+ * shared-page completion, which is issued only from here.  Both contexts
+ * remain alive until their respective completions drain.
+ */
+void f2fs_copack_complete_partner(struct decompress_io_ctx *dic, bool failed)
+{
+	struct decompress_io_ctx *odd = dic->copack_partner_dic;
+	void *src, *dst;
+
+	if (!odd)
+		return;
+
+	/* There is exactly one shared read completion for this pair. */
+	dic->copack_partner_dic = NULL;
+	if (failed) {
+		WRITE_ONCE(odd->failed, true);
+	} else {
+		src = kmap_local_page(dic->cpages[dic->nr_cpages - 1]);
+		dst = kmap_local_page(odd->cpages[odd->nr_cpages - 1]);
+		memcpy(dst, src, PAGE_SIZE);
+		kunmap_local(dst);
+		kunmap_local(src);
+	}
+
+	if (atomic_dec_and_test(&odd->remaining_pages))
+		f2fs_decompress_cluster(odd);
+}
+
+/*
  * This is called when a page of a compressed cluster has been read from disk
  * (or failed to be read from disk).  It checks whether this page was the last
  * page being waited on in the cluster, and if so, it decompresses the cluster
@@ -909,6 +942,10 @@ void f2fs_end_read_compressed_page(struct page *page, bool failed,
 	else if (blkaddr)
 		f2fs_cache_compressed_page(sbi, page,
 					dic->inode->i_ino, blkaddr);
+
+	if (dic->copack_partner_dic &&
+			page == dic->cpages[dic->nr_cpages - 1])
+		f2fs_copack_complete_partner(dic, failed);
 
 	if (atomic_dec_and_test(&dic->remaining_pages))
 		f2fs_decompress_cluster(dic);

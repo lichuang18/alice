@@ -1,3 +1,14 @@
 gcc -O2 -Wall -Wextra -pthread \
     fig2_realdata_bench.c \
     -o fig2_realdata_bench
+
+
+
+# fig2 性能测试
+AUTO_CONFIRM=1 THREADS="1 2 4 8" ALGOS="lz4" DATASETS="enwik9 fdroid silesia linux_kernel" SYSTEMS="f2fscomp copack" ./fig2_batch_benchmark.sh
+
+第一个参数作用是为了不用手动输入y，上面的脚本一键运行就会得到lz4算法的4种线程的4个数据集的3种负载类型处理的实验结果，就可以画出dac用的一张图，哦当然我画图数据是执行了5次求平均画的。
+
+后面为了期刊内容扩展，需要测试多种压缩算法时，修改lz4为其他即可。
+
+
