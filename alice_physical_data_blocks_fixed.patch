@@ -1,0 +1,50 @@
+diff --git a/sysfs.c b/sysfs.c
+index 71e636c..0f8b95c 100644
+--- a/sysfs.c
++++ b/sysfs.c
+@@ -96,6 +96,29 @@ static ssize_t free_segments_show(struct f2fs_attr *a,
+ 			(unsigned long long)(free_segments(sbi)));
+ }
+ 
++/*
++ * Number of currently valid physical blocks in data segments, including
++ * CoPack hidden blocks.  This is not the inode compression reservation count.
++ */
++static ssize_t physical_data_blocks_show(struct f2fs_attr *a,
++		struct f2fs_sb_info *sbi, char *buf)
++{
++	struct sit_info *sit_i = SIT_I(sbi);
++	unsigned int segno;
++	u64 blocks = 0;
++
++	down_read(&sit_i->sentry_lock);
++	for (segno = 0; segno < MAIN_SEGS(sbi); segno++) {
++		struct seg_entry *se = get_seg_entry(sbi, segno);
++
++		if (IS_DATASEG(se->type))
++			blocks += se->valid_blocks;
++	}
++	up_read(&sit_i->sentry_lock);
++
++	return sysfs_emit(buf, "%llu\n", (unsigned long long)blocks);
++}
++
+ static ssize_t ovp_segments_show(struct f2fs_attr *a,
+ 		struct f2fs_sb_info *sbi, char *buf)
+ {
+@@ -736,6 +759,7 @@ F2FS_GENERAL_RO_ATTR(unusable);
+ F2FS_GENERAL_RO_ATTR(encoding);
+ F2FS_GENERAL_RO_ATTR(mounted_time_sec);
+ F2FS_GENERAL_RO_ATTR(main_blkaddr);
++F2FS_GENERAL_RO_ATTR(physical_data_blocks);
+ #ifdef CONFIG_F2FS_STAT_FS
+ F2FS_STAT_ATTR(STAT_INFO, f2fs_stat_info, cp_foreground_calls, cp_count);
+ F2FS_STAT_ATTR(STAT_INFO, f2fs_stat_info, cp_background_calls, bg_cp_count);
+@@ -800,6 +824,7 @@ static struct attribute *f2fs_attrs[] = {
+ 	ATTR_LIST(gc_urgent),
+ 	ATTR_LIST(reclaim_segments),
+ 	ATTR_LIST(main_blkaddr),
++	ATTR_LIST(physical_data_blocks),
+ 	ATTR_LIST(max_small_discards),
+ 	ATTR_LIST(discard_granularity),
+ 	ATTR_LIST(batched_trim_sections),

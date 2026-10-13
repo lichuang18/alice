@@ -2105,12 +2105,12 @@ static int f2fs_write_hidden_copack_pair(struct compress_ctx *even,
 	 * test can compare the exact pair count with P2.  Disable this printk
 	 * before performance measurements.
 	 */
-	pr_info("COPACK_P3 ino=%lu pair=%lu mode=%c%c run=%u shared=%u "
-			"even_last=%u odd_first=%u anchor=(%u,%u) saved=1\n",
-		inode->i_ino, pair_idx, even_rescue ? 'R' : 'N',
-		odd_rescue ? 'R' : 'N', run_blocks, new_blks[even_private],
-		new_blks[even_private - 1], new_blks[even_private + 1],
-		anchor_nid, even_ofs);
+	// pr_info("COPACK_P3 ino=%lu pair=%lu mode=%c%c run=%u shared=%u "
+	// 		"even_last=%u odd_first=%u anchor=(%u,%u) saved=1\n",
+	// 	inode->i_ino, pair_idx, even_rescue ? 'R' : 'N',
+	// 	odd_rescue ? 'R' : 'N', run_blocks, new_blks[even_private],
+	// 	new_blks[even_private - 1], new_blks[even_private + 1],
+	// 	anchor_nid, even_ofs);
 
 	kfree(sums);
 	kfree(new_blks);

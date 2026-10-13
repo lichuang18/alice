@@ -1,0 +1,3 @@
+gcc -O2 -Wall -Wextra -pthread \
+    fig2_realdata_bench.c \
+    -o fig2_realdata_bench
